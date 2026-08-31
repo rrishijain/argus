@@ -78,7 +78,74 @@ units. Do the wiring for them when asked.
   carousel agent was unwired on 2026-08-21; its project still sits on disk, unused. The publisher
   refuses to post unless the token's own handle matches `IG_EXPECTED_USERNAME` — if a run exits 3,
   fix the token, never the guard.
+- **Images for both publishers come from KIE** (`https://api.kie.ai`, job flow
+  createTask -> recordInfo -> download). Default model is **`nano-banana-2`**
+  (8 credits, ~60-90s): the cheaper `google/nano-banana` at 4 credits stutters on
+  long strings — it duplicated words on 7 of 8 slides of the firefly deck and
+  hallucinated a fourth header token. Its request schema differs
+  (`aspect_ratio`/`image_input`/`resolution` vs `image_size`/`image_urls`), so
+  both scripts build the request through one model-aware function. One key,
+  canonically `KIE_API_KEY`, in argus/.env AND each agent project's own .env —
+  the agents load their own, so all three must carry it. Balance:
+  `node scripts/generate_slides.mjs --credits` (carousel) or
+  `python3 scripts/kie_image.py --credits` (ds-seo-agent).
+  Carousel renders via `scripts/generate_slides.mjs`; portrait slides route to
+  `google/nano-banana-edit` with his reference frames hosted on WP (cached in
+  `assets/portrait-refs/.hosted.json`). Gemini stays as fallback in both —
+  set `CAROUSEL_RENDERER=gemini` so verify_slides re-rolls on the same engine.
+  Never put hex codes in an image prompt; models render them as literal text.
 - Never test publishing with a live intent — say "as a draft" / pass `args.dry_run: true`.
+
+## Competitor intel + bulk creatives (added 2026-08-31)
+
+- `competitor-intel` (Publish deck; voice "competitor report on <brand>") → cwd =
+  the competitor-xray project at `~/Desktop/Ai Resources - Most Important/Ai Agents/Zip Files/competitor-xray`
+  (override `COMPETITOR_XRAY_DIR`). Its /xray pipeline needs APIFY_TOKEN +
+  FIRECRAWL_API_KEY (env → ./.env → ~/.competitor-xray/.env) — NOT configured yet,
+  so runs take PATH B (Apify/Semrush connectors + public builtwith/similarweb pages)
+  until those keys exist. No-brand runs pick from `<vault>/ops/competitors.md`
+  (seeded with upGrad). Report: `<vault>/inbox/reports/competitors/`.
+- `bulk-creatives` (Publish deck; voice "make 10 ads for <offer>") → cwd =
+  `ads-generator-kit` (override `ADS_KIT_DIR`). Writes `briefs/ads/<slug>.yaml`,
+  renders via `python3 tools/build_ads.py` (Gemini key in the kit's own .env),
+  args {topic, count 1-30 (default 6), dry_run = copy only, no images}. Picks one
+  render skill per batch (sophisticated / coursib / best-performing / isaac);
+  Vels MBA copy is governed by the kit's VelsMBS/anti-vels.md. Top 3 PNGs are
+  copied to `<vault>/inbox/reports/creatives/`.
+- Both are in DEDUPE_SKILLS (they spend real API credits — no double-fires).
+
+## Voice tone + stop (added 2026-08-31)
+
+- Persona is "sharp friend", not butler. It lives in THREE places that must stay
+  in the same register: `AUTONOMOUS_PREFIX` (runner.js), the Voice line in
+  `routerSystem()` and the `smalltalk()` replies (lib/router.ts).
+- Stop speech: the ■ Stop Voice button (bottom-left, next to Transcript) and Esc
+  both call `voice.stopAll()` — stop() locally plus a localStorage broadcast
+  (`argus.voice.stop`) that silences EVERY tab, covering overlap from a tab that
+  lost the speech lead mid-utterance.
+
+## Engagement layer (added 2026-08-31)
+
+- `lib/engagement.ts` computes streaks/quests/momentum/records from files the
+  vault already writes (runs, publish-ledger, daily-note frontmatter + Daily
+  Drivers, meta-daily.csv) — HUD-domain math in TS. Marketing verdicts STAY in
+  `marketing_context.py`; engagement never judges a marketing number against a
+  target. Bests persist in `system/engagement-records.json` (written only by
+  the Next server, on improvement; first sight of a measure seeds silently —
+  delete the file to re-seed without celebrations).
+- Celebrations: `lib/celebrate.ts` is a PURE diff of consecutive same-day
+  engagement snapshots; HUD primes the first snapshot and re-primes across
+  midnight (runsPrimedRef pattern) so reloads/rollovers never fire. Tier
+  minor = panel shimmer + chime; major/record also flare the WireCore bundle
+  via the `celebrate` prop (seq+tier impulse) and speak ONE ambient line.
+- Rishi rejected "momentum" and "quests" as UI concepts (2026-08-31): the
+  engine still computes them (celebration diffs use quests), but NOTHING on
+  the wall may display an invented composite score or the word "quests".
+  Visible gamification stays concrete: streak dots + 🔥 count (TopBar),
+  publish caps on Shipped, records/near-miss line, Daily Drivers checkboxes.
+- Chimes (`lib/sound.ts`) are oscillator-only, drop (never queue) before the
+  first user gesture, respect the voice lead lock, mute via `M` / ♪ button
+  (`argus.sound.muted`). Demo keys: `6` major, `7` record celebration.
 
 ## Load-bearing couplings (break one and voice quietly misroutes)
 
@@ -92,7 +159,15 @@ units. Do the wiring for them when asked.
 - `HUD_TZ` (lib/config.ts) ⟷ the runner's `HUD_TZ` — both default
   America/Chicago; change them TOGETHER or "today" splits across two dates.
 - `.boot-stagger` CSS sections must never receive a second `animation` —
-  it cancels `boot-in ... forwards` and blanks the panel.
+  it cancels `boot-in ... forwards` and blanks the panel. Overlays animate on
+  pseudo-elements instead: `.voice-hot` owns `::before`, `.quest-flash` owns
+  `::after` — keep new overlays off both.
+- Any absolutely-centered element (`translate(-50%,-50%)`, e.g. `.sun-core`)
+  needs keyframes that RESTATE the translate in every frame — a keyframe
+  ending on `transform: none` with `forwards` fill wipes the centering.
+- Publish caps: `DAILY_CAP` in runner/runner.js ⟷ `publishes` goals in
+  `lib/engagement.ts` — the Shipped chips must show the caps the runner
+  actually enforces.
 
 ## Editing gotchas
 
@@ -101,6 +176,14 @@ units. Do the wiring for them when asked.
 - Testing `/api/voice` with a command phrase queues a REAL intent the
   runner will execute. Use tier-2 questions ("what's in the queue") for
   pipeline tests.
-- Two HUD tabs = double audio. Browser autoplay needs one click/keypress.
+- Speech is cross-tab locked (`argus.voice.lead` in localStorage, lib/voiceClient.ts):
+  only the tab you last touched talks, so extra tabs no longer double the
+  audio. Browser autoplay still needs one click/keypress per tab.
+- Run completions are coalesced: several runs landing together speak ONE
+  line (`batchAnnouncement` in HUD.tsx); voice-ask answers stay individual
+  and rank as replies, so asking something cuts off background chatter.
+- Voice/accent live in voice-server: `KOKORO_VOICE` + `KOKORO_SPEED`
+  (+ optional `KOKORO_LANG`; accent otherwise follows the voice prefix —
+  b=en-gb, a=en-us). `python voice-server/make_samples.py` re-auditions.
 - Next dev can hang after webpack cache corruption: kill node on 3107,
   delete `.next/`, restart.

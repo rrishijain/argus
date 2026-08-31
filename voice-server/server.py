@@ -50,6 +50,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = 3108
 VOICE = os.environ.get("KOKORO_VOICE", "bm_george")  # calm British male
 SPEED = float(os.environ.get("KOKORO_SPEED", "1.0"))
+# Kokoro voice ids are <lang><gender>_<name>: b = British, a = American,
+# and so on. Phonemize in the voice's OWN accent — an af_/am_ voice read
+# with en-gb rules comes out mushy. Set KOKORO_LANG to override.
+VOICE_LANGS = {"a": "en-us", "b": "en-gb", "e": "es", "f": "fr-fr",
+               "h": "hi", "i": "it", "j": "ja", "p": "pt-br", "z": "cmn"}
+LANG = os.environ.get("KOKORO_LANG") or VOICE_LANGS.get(VOICE[:1], "en-us")
 SAMPLE_RATE = 24000  # kokoro output rate
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small.en")
 # domain vocab bias — keeps acronyms like MRR from coming out "M.R.A."
@@ -205,6 +211,8 @@ def health():
         "ok": True,
         "engine": "kokoro",
         "voice": VOICE,
+        "lang": LANG,
+        "speed": SPEED,
         "device": KOKORO_DEVICE,
         "stt": {"ok": True, "model": WHISPER_MODEL, "device": WHISPER_DEVICE},
         "wake": {
@@ -242,7 +250,7 @@ def speak(text: str = ""):
     def gen():
         yield wav_header(SAMPLE_RATE)
         for chunk in chunks_of(text):
-            samples, sr = kokoro.create(chunk, voice=VOICE, speed=SPEED, lang="en-gb")
+            samples, sr = kokoro.create(chunk, voice=VOICE, speed=SPEED, lang=LANG)
             pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
             yield pcm.tobytes()
             # short breath between sentences
@@ -256,11 +264,11 @@ if __name__ == "__main__":
     # warm both models so the first real request doesn't pay init cost —
     # whisper's first CUDA run JITs kernels (~9s); feed it kokoro's warmup
     # audio so the whole pipeline is hot
-    samples, _ = kokoro.create("Systems online.", voice=VOICE, speed=SPEED, lang="en-gb")
+    samples, _ = kokoro.create("Systems online.", voice=VOICE, speed=SPEED, lang=LANG)
     warm = io.BytesIO()
     import soundfile as sf
     sf.write(warm, samples, SAMPLE_RATE, format="WAV")
     warm.seek(0)
     list(whisper.transcribe(warm, beam_size=1, language="en")[0])
-    print(f"kokoro({KOKORO_DEVICE}) + whisper({WHISPER_MODEL}/{WHISPER_DEVICE}) warm — serving :{PORT} voice={VOICE}")
+    print(f"kokoro({KOKORO_DEVICE}) + whisper({WHISPER_MODEL}/{WHISPER_DEVICE}) warm — serving :{PORT} voice={VOICE}/{LANG}")
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")

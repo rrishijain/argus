@@ -106,6 +106,13 @@ const SKILL_CWD = {
   "news-carousel":
     env("NEWS_CAROUSEL_AGENT_DIR") ||
     join(AGENTS_ROOT, "CarouselsAgents", "rrishijainxCarousel-Final"),
+  // Competitor X-Ray — Meta-funnel teardown project (BYO Apify/Firecrawl keys;
+  // the prompt degrades to connector/web research when keys are absent).
+  "competitor-intel":
+    env("COMPETITOR_XRAY_DIR") || join(AGENTS_ROOT, "..", "Zip Files", "competitor-xray"),
+  // Bulk static-ads pipeline (tools/build_ads.py + the ad skills; Gemini key
+  // lives in the kit's own .env).
+  "bulk-creatives": env("ADS_KIT_DIR") || join(AGENTS_ROOT, "ads-generator-kit"),
 };
 function cwdFor(skill) {
   const dir = SKILL_CWD[skill];
@@ -116,6 +123,8 @@ function cwdFor(skill) {
 const SKILL_MODEL = {
   "ds-blog-publish": "claude-opus-4-8",
   "news-carousel": "claude-opus-4-8",
+  "competitor-intel": "claude-opus-4-8",
+  "bulk-creatives": "claude-opus-4-8",
 };
 // Hard timeouts (minutes). Blog pipeline (topical check → write → images →
 // publish) is 22–44 min by the skill's own estimate.
@@ -124,6 +133,10 @@ const TIMEOUT_MIN = {
   "ds-blog-publish": 50,
   // scan → verify → write → render 8-10 images → vision QA → upload → publish
   "news-carousel": 45,
+  // pull ads → rank → decode top 5 → context → gallery (or fallback research)
+  "competitor-intel": 45,
+  // copy for N angles → brief → render N×2 images via Gemini → note
+  "bulk-creatives": 60,
 };
 // Live-publish caps per HUD_TZ day, enforced here (a prompt can be talked
 // around; the runner can't). dry_run intents don't count.
@@ -274,6 +287,10 @@ function deliverablePathFor(intent) {
       return `inbox/reports/publish/${date}-blog-${slugify(args.topic || "next-from-backlog", 40)}-${id8}.md`;
     case "news-carousel":
       return `inbox/reports/publish/${date}-news-carousel-${slugify(args.topic || "todays-story", 40)}-${id8}.md`;
+    case "competitor-intel":
+      return `inbox/reports/competitors/${date}-${slugify(args.brand || args.topic || "competitor", 40)}-${id8}.md`;
+    case "bulk-creatives":
+      return `inbox/reports/creatives/${date}-bulk-ads-${slugify(args.topic || "latest-brief", 40)}-${id8}.md`;
     default:
       return null;
   }
@@ -283,7 +300,7 @@ function deliverablePathFor(intent) {
 // non-interactive -p mode) and carries the SPOKEN SUMMARY CONTRACT — the
 // first line of every reply is read aloud verbatim by the voice layer.
 const AUTONOMOUS_PREFIX =
-  "Execute the requested task autonomously in headless mode. Do not ask the user for confirmation. Do not call AskUserQuestion. Continue until the deliverable is written.\n\nSPOKEN SUMMARY CONTRACT: the FIRST line of your final reply is read aloud to the user by a voice assistant. Make it ONE conversational sentence (max ~140 chars) a calm butler would say - lead with the outcome PLUS two or three concrete highlights from what you produced (names, titles, the numbers that matter) — 'the report is done' with no specifics is useless, round big numbers to clean magnitudes (say 'about 13 thousand', never '13,206'). Never mention: headless, autonomous, task, deliverable, file paths, markdown, or process narration ('waiting for', 'running'). Every other detail belongs in the written deliverable, not the spoken line.";
+  "Execute the requested task autonomously in headless mode. Do not ask the user for confirmation. Do not call AskUserQuestion. Continue until the deliverable is written.\n\nSPOKEN SUMMARY CONTRACT: the FIRST line of your final reply is read aloud to the user by a voice assistant. Make it ONE conversational sentence (max ~140 chars) the way a sharp friend would text you - warm, casual, first person, contractions ('it's live', 'we're at'), zero corporate stiffness - lead with the outcome PLUS two or three concrete highlights from what you produced (names, titles, the numbers that matter) — 'the report is done' with no specifics is useless, round big numbers to clean magnitudes (say 'about 13 thousand', never '13,206'). Never mention: headless, autonomous, task, deliverable, file paths, markdown, or process narration ('waiting for', 'running'). Every other detail belongs in the written deliverable, not the spoken line.";
 
 /**
  * Map intent.skill → the prompt passed to `claude -p`. Every prompt is
@@ -369,7 +386,25 @@ function buildPrompt(intent, deliverable) {
       const abs = join(VAULT_ROOT, deliverable);
       const topic = typeof args.topic === "string" && args.topic.trim() ? args.topic.trim() : null;
       const dry = args.dry_run === true;
-      return `${AUTONOMOUS_PREFIX}\n\nYou are running inside the Breaking AI News Carousel project (your cwd) — this publishes to Rishi's personal Instagram @rrishijain, NOT Digital Scholar. Run the /news-carousel-publish skill (the HEADLESS one — not /break-news, which stops for approval) ${topic ? `for this story: ${JSON.stringify(topic)}` : "with no topic: scan today's sources and take the highest-scoring story that clears the three gates"}${dry ? ", dry_run=true (render, host and build containers, never post)" : ""}.\n\nHEADLESS RULES (override anything interactive in that project's skills):\n- Never ask. Shipping nothing is a valid, non-failing outcome — if no story clears story-selection, or verification fails, write the note with status: no-story and stop. Do not lower the bar to fill the slot.\n- The vision QA gate is binding: after \`node scripts/verify_slides.mjs content/queue/<slug> --fix --attempts 2\`, any slide still failing means do NOT publish. Write the note with status: blocked naming the slide.\n- Host slides with \`node scripts/upload_wp.mjs content/queue/<slug>\` before publishing — Instagram cannot fetch a local file.\n- Publish with \`node scripts/publish_instagram.mjs content/queue/<slug>${dry ? " --dry-run" : ""}\`. The ledger is ${LEDGER_FILE} (HUD_VAULT_ROOT is set, so the script finds it on its own). Exit 3 = account guard (wrong or dead token) and exit 4 = this slug already went live: in both cases write the note with status: blocked and say so plainly. Never edit the guard, the token or IG_EXPECTED_USERNAME to get past it.\n${dry ? "" : `- After a successful live post: \`node scripts/ledger_add.mjs content/published/<slug> --status published --url <permalink>\`, then \`node scripts/upload_wp.mjs content/published/<slug> --cleanup\` to take the slides back out of the media library.\n`}\nDeliverable at exactly ${abs} (absolute path — the vault, not this project): YAML frontmatter \`date\`, \`skill: news-carousel\`, \`slug\`, \`headline\`, \`status: published|dry-run|no-story|blocked\`, \`link\` (the Instagram permalink, ONLY when live), \`slides\`, \`tags: [publish, carousel, ai-news]\`; body = the hook, one line on the story, the angle, the full caption, and both source URLs.\n\nSpoken first line: ${dry ? 'Rendered "<hook>", <N> slides, ready to post but nothing went live.' : 'The carousel "<hook>" is live on Instagram, <N> slides.'} If nothing shipped: "Nothing cleared the bar today — <reason in six words>." If blocked: "I held the carousel back — <reason in six words>; details are in the note."\n\nEnd your reply with: SAVED ${abs}`;
+      return `${AUTONOMOUS_PREFIX}\n\nYou are running inside the Breaking AI News Carousel project (your cwd) — this publishes to Rishi's personal Instagram @rrishijain, NOT Digital Scholar. Run the /news-carousel-publish skill (the HEADLESS one — not /break-news, which stops for approval) ${topic ? `for this story: ${JSON.stringify(topic)}` : "with no topic: scan the sources across the full freshness window (today plus the previous two days in Asia/Kolkata) and take the highest-scoring story that clears the three gates, preferring the freshest"}${dry ? ", dry_run=true (render, host and build containers, never post)" : ""}.\n\nHEADLESS RULES (override anything interactive in that project's skills):\n- Never ask. Shipping nothing is a valid, non-failing outcome — if no story clears story-selection, or verification fails, write the note with status: no-story and stop. Do not lower the bar to fill the slot.
+- Freshness is a rolling 3-day window, not a single day. On a thin day reach BACK through the window for a big story before you reach DOWN into a niche one. A story over a day old is a catch-up: it needs Reach >= 4 and score >= 150, must be dated honestly in the copy, and never carries a BREAKING tag or the word "today". When nothing ships, the note must say how many days were scanned and how many candidates each day held.\n- Render in two steps: \`node scripts/generate_portrait.mjs content/queue/<slug>\` (styled cut-out of the host for slides 1 and 8 — each needs a \`portrait_prompt\` naming attire, a story-relevant accessory, the hand gesture and the expression; aim the cover gesture toward the viewer's LEFT and slide 8's downward, and never describe his face), then \`node scripts/render_slides_html.mjs content/queue/<slug>\` (real text in system Chrome, no image API, no cost, cannot garble). If the renderer warns it fell back to a raw reference frame, the portrait step did not run — fix it rather than shipping a pasted headshot. Only reach for the generative renderers (generate_slides.mjs / generate_slides_gemini.mjs) if the deck genuinely needs illustration rather than layout.\n- The vision QA gate applies to GENERATIVELY rendered decks: after \`node scripts/verify_slides.mjs content/queue/<slug> --fix --attempts 2\`, any slide still failing means do NOT publish — write the note with status: blocked naming the slide. Skip that gate for an HTML-rendered deck: the copy is composited from text_strings, not drawn, so there is nothing to misspell and no likeness to judge.\n- Host slides with \`node scripts/upload_wp.mjs content/queue/<slug>\` before publishing — Instagram cannot fetch a local file.\n- Publish with \`node scripts/publish_instagram.mjs content/queue/<slug>${dry ? " --dry-run" : ""}\`. The ledger is ${LEDGER_FILE} (HUD_VAULT_ROOT is set, so the script finds it on its own). Exit 3 = account guard (wrong or dead token) and exit 4 = this slug already went live: in both cases write the note with status: blocked and say so plainly. Never edit the guard, the token or IG_EXPECTED_USERNAME to get past it.\n${dry ? "" : `- After a successful live post: \`node scripts/ledger_add.mjs content/published/<slug> --status published --url <permalink>\`, then \`node scripts/upload_wp.mjs content/published/<slug> --cleanup\` to take the slides back out of the media library.\n`}\nDeliverable at exactly ${abs} (absolute path — the vault, not this project): YAML frontmatter \`date\`, \`skill: news-carousel\`, \`slug\`, \`headline\`, \`status: published|dry-run|no-story|blocked\`, \`link\` (the Instagram permalink, ONLY when live), \`slides\`, \`story_date\`, \`story_age_days\`, \`tags: [publish, carousel, ai-news]\`; body = the hook, one line on the story, the angle, the full caption, and both source URLs.\n\nSpoken first line: ${dry ? 'Rendered "<hook>", <N> slides, ready to post but nothing went live.' : 'The carousel "<hook>" is live on Instagram, <N> slides.'} If nothing shipped: "Nothing cleared the bar today — <reason in six words>." If blocked: "I held the carousel back — <reason in six words>; details are in the note."\n\nEnd your reply with: SAVED ${abs}`;
+    }
+    case "competitor-intel": {
+      const abs = join(VAULT_ROOT, deliverable);
+      const brandArg = typeof args.brand === "string" && args.brand.trim() ? args.brand.trim()
+        : typeof args.topic === "string" && args.topic.trim() ? args.topic.trim() : null;
+      const compFile = join(VAULT_ROOT, "ops", "competitors.md");
+      const compDir = join(VAULT_ROOT, "inbox", "reports", "competitors");
+      return `${AUTONOMOUS_PREFIX}\n\nYou are running inside the Competitor X-Ray project (your cwd — its CLAUDE.md and /xray skill apply). Produce a FULL competitive intelligence report on ${brandArg ? JSON.stringify(brandArg) : `no named brand: read ${compFile} (one competitor per line, # comments ignored) and pick the one whose newest report under ${compDir}/ is oldest or missing; if the file is missing, use "upGrad" and create it seeded with that line. Name your pick in the spoken line.`}\n\nHEADLESS RULES:\n- Never ask. No Chrome MCP. Every number needs a source; a blank source is written as "data unavailable" — never fabricated. SimilarWeb-style traffic figures are modelled estimates and the report must say so.\n- PATH A (preferred): if APIFY_TOKEN and FIRECRAWL_API_KEY resolve (env → ./.env → ~/.competitor-xray/.env), run the /xray pipeline stage by stage — cost levers ~150 ads pulled, --top 5 decoded — into competitor-xray-runs/<slug>-<date>/.\n- PATH B (keys missing): research directly — the brand's Meta Ad Library via an Apify MCP connector actor if available, else WebSearch; site tech from the public builtwith.com/<domain> page (WebFetch); traffic from the public similarweb.com/website/<domain> page; top ~20 organic + paid keywords via the claude.ai Semrush connector (organic_research / keyword_research) if present, else mark unavailable. Say plainly in the report which path ran and which sources came up dry.\n\nBOTH paths must cover: total active ads, video vs image split, partnership vs brand ads; the messages they repeat; personas inferred from the ads alone; top 10 longest-running ads; creative velocity (launches and dates); tech stack (analytics, pixels, email platform, CRO tools); traffic scale, channel split, top keywords and referrers; and "## 5 moves to steal or counter" — five specific numbered moves for Digital Scholar.\n\nDeliverables:\n1. Self-contained HTML report with inline charts at ${compDir}/<date>-<brand-slug>/report.html (copy gallery.html there too if PATH A produced one).\n2. A PDF of the same report at ${compDir}/<date>-<brand-slug>/report.pdf — render it from report.html with headless Chrome: try "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new --disable-gpu --print-to-pdf=<pdf path> --no-pdf-header-footer file://<report.html>, falling back to chrome/chromium/msedge on PATH. If no Chrome-family browser exists, skip the PDF and say so in the note — never fail the run over it.\n3. The note at exactly ${abs}: YAML frontmatter \`date\`, \`skill: competitor-intel\`, \`brand\`, \`path: xray|fallback\`, \`html: <vault-relative path to report.html>\`, \`pdf: <vault-relative path to report.pdf, omit if skipped>\`, \`tags: [competitor, intel]\`; body = executive summary, the 5 moves, key numbers with sources, what was unavailable.\n\nSpoken first line: "The <brand> teardown's done — they're running about <N> ads, <sharpest finding>, and there's <one move worth stealing>."\n\nEnd your reply with: SAVED ${abs}`;
+    }
+    case "bulk-creatives": {
+      const abs = join(VAULT_ROOT, deliverable);
+      const topic = typeof args.topic === "string" && args.topic.trim() ? args.topic.trim() : null;
+      const n = Number(args.count);
+      const count = Number.isInteger(n) && n >= 1 && n <= 30 ? n : 6;
+      const dry = args.dry_run === true;
+      const shipDir = join(VAULT_ROOT, "inbox", "reports", "creatives");
+      return `${AUTONOMOUS_PREFIX}\n\nYou are running inside the Ads Generator Kit project (your cwd — its CLAUDE.md, brand files and the ad skills under .claude/skills apply). Produce a batch of ${count} static ad creatives ${topic ? `for: ${JSON.stringify(topic)}` : "for the most recent real offer in briefs/ads/ (newest yaml that is not an _example or _smoketest); name it in your spoken line"}.\n\nHEADLESS RULES (override the ad-campaign-architect interview):\n- Never ask. Infer product, audience and offer from the topic plus the brand/ files; state every inference in the note.\n- Pick ONE render skill by fit: sophisticated-ads (courses/upskilling, premium real-photo), coursib-style-ads (one offer, many wildly different looks), best-performing-ads (30-day AI Mastery locked layout), isaac-workshop-ads (live workshop, instructor-led). Vels MBA content: read VelsMBS/anti-vels.md FIRST — its rules beat everything, including this prompt.\n- Copy before pixels: ${count} variants, each committing to ONE distinct persuasion angle (no two share an angle), headline under 9 words, single CTA, no em-dashes, never a hex code inside an image prompt.\n- Write the campaign brief at briefs/ads/<slug>.yaml (schema in the tools/build_ads.py docstring), ratios 1:1 and 9:16.\n- ${dry ? "DRY RUN: \`python3 tools/build_ads.py briefs/ads/<slug>.yaml --dry-run\` — prompts only, no images, no API spend." : "Render: \`python3 tools/build_ads.py briefs/ads/<slug>.yaml\`. A variant that errors gets ONE retry via --only <id>; report anything still failing rather than re-rolling forever."}\n- Outputs land in deliverables/content/ads/<slug>/. ${dry ? "" : `Copy the 3 strongest PNGs (your judgment) to ${shipDir}/<date>-<slug>/ so the dashboard side has them.`}\n\nDeliverable at exactly ${abs} (absolute path — the vault, not this project): YAML frontmatter \`date\`, \`skill: bulk-creatives\`, \`topic\`, \`count: ${count}\`, \`render_skill\`, \`brief: briefs/ads/<slug>.yaml\`, \`status: rendered|dry-run|partial\`, \`tags: [creative, ads]\`; body = the angle table (variant id → angle → headline → CTA), the render log (rendered/failed per ratio), and every output file path.\n\nSpoken first line: ${dry ? `"I wrote ${count} ad concepts for <topic> — <two angle names> and more; nothing rendered, it was a dry run."` : `"<N> creatives are done for <topic> — angles like <two angle names>; the best three are on the board."`}\n\nEnd your reply with: SAVED ${abs}`;
     }
     // --- EXAMPLE: adding your own skill -----------------------------------
     // case "my-skill":
@@ -395,7 +430,14 @@ const SERIAL_SKILLS = new Set([
   "ds-blog-publish",
   "news-carousel",
 ]);
-const DEDUPE_SKILLS = new Set(["morning-report", "inbox-brief", "ds-blog-publish", "news-carousel"]);
+const DEDUPE_SKILLS = new Set([
+  "morning-report",
+  "inbox-brief",
+  "ds-blog-publish",
+  "news-carousel",
+  "competitor-intel",
+  "bulk-creatives",
+]);
 // (hard timeouts live in TIMEOUT_MIN above; default 10 min)
 
 let active = 0;

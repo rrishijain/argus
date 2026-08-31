@@ -16,6 +16,9 @@ export interface DeckItem {
   label: string;
   /** default intent args sent with the button (voice can override) */
   args?: Record<string, unknown>;
+  /** ask the user ONE thing on click; blank keeps the skill's fallback,
+   *  cancel queues nothing */
+  ask?: { key: string; label: string };
   enabled?: boolean;
 }
 
@@ -49,6 +52,16 @@ export const DECK_GROUPS: { group: string; items: DeckItem[] }[] = [
     items: [
       { skill: "ds-blog-publish", label: "Publish Blog" },
       { skill: "news-carousel", label: "News Carousel" },
+      {
+        skill: "competitor-intel",
+        label: "Competitor Intel",
+        ask: { key: "brand", label: "Which competitor? Brand name or website.\n(Leave blank to rotate through ops/competitors.md)" },
+      },
+      {
+        skill: "bulk-creatives",
+        label: "Bulk Creatives",
+        ask: { key: "topic", label: "Ads for which offer / product?\n(Leave blank to reuse the newest brief in the kit)" },
+      },
     ],
   },
   {
@@ -79,12 +92,18 @@ export default function CommandDeck({
 
   const fire = async (item: DeckItem) => {
     if (cooldown[item.skill]) return;
+    const args: Record<string, unknown> = { ...(item.args ?? {}) };
+    if (item.ask) {
+      const v = window.prompt(item.ask.label, "");
+      if (v === null) return; // cancelled — queue nothing
+      if (v.trim()) args[item.ask.key] = v.trim();
+    }
     setCooldown((c) => ({ ...c, [item.skill]: true }));
     try {
       const res = await fetch("/api/queue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ skill: item.skill, args: item.args ?? {} }),
+        body: JSON.stringify({ skill: item.skill, args }),
       });
       onQueued(item.skill, res.ok);
     } catch {

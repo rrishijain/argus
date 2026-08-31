@@ -25,6 +25,9 @@ function cleanArgs(raw: unknown): Record<string, unknown> {
   if (RANGES.has(Number(a.range))) out.range = Number(a.range);
   if (typeof a.model === "string" && MODELS.has(a.model)) out.model = a.model;
   if (typeof a.topic === "string" && a.topic.trim()) out.topic = a.topic.trim().slice(0, 200);
+  if (typeof a.brand === "string" && a.brand.trim()) out.brand = a.brand.trim().slice(0, 120);
+  const n = Number(a.count);
+  if (Number.isInteger(n) && n >= 1 && n <= 30) out.count = n;
   if (a.dry_run === true) out.dry_run = true;
   return out;
 }

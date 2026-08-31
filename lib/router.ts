@@ -53,6 +53,7 @@ export const PANEL_IDS = [
   "deck",
   "priorities",
   "schedule",
+  "news", // AI Newsdesk (left column, live feeds)
   // legacy ids — still emitted by older prompts / memory; HUD maps them
   "vitals",
   "pipeline",
@@ -90,6 +91,8 @@ const SKILL_ALIASES: [RegExp, string][] = [
   // publishing — bare forms; topic-carrying sentences go through TOPIC_COMMANDS
   [/publish (?:a |the )?blog|blog post|seo article/, "ds-blog-publish"],
   [/carousel|break(?:ing)? (?:the )?news|news drop/, "news-carousel"],
+  [/competitor (?:intel(?:ligence)?|analysis|report|x ?ray|teardown|scan)|competitive intel(?:ligence)?/, "competitor-intel"],
+  [/bulk (?:ads|creatives?)|batch of (?:ads|creatives?)|ad batch|static ads|ad variants|creative batch/, "bulk-creatives"],
 ];
 
 // --- intent args ---------------------------------------------------------------
@@ -129,6 +132,14 @@ const TOPIC_COMMANDS: [RegExp, string][] = [
     /^(?:hey |ok |okay )?(?:(?:jarvis|argus),? )?(?:please )?(?:build|make|create|publish|post|ship|generate|render)\s+(?:a |an |the )?(?:new )?(?:instagram |ig |insta )?carousel(?:\s+(?:about|on|for|titled|called)\s+(?<topic>.+))?$/,
     "news-carousel",
   ],
+  [
+    /^(?:hey |ok |okay )?(?:(?:jarvis|argus),? )?(?:please )?(?:run|do|pull|build|make|create|generate|get|start)\s+(?:a |an |the )?(?:full |fresh |new )?(?:competitor|competitive|competition)\s+(?:intel(?:ligence)?|analysis|report|x ?ray|teardown|scan)(?:\s+report)?(?:\s+(?:on|for|about|against)\s+(?<topic>.+))?$/,
+    "competitor-intel",
+  ],
+  [
+    /^(?:hey |ok |okay )?(?:(?:jarvis|argus),? )?(?:please )?(?:make|generate|create|build|render|write)\s+(?:me\s+)?(?:(?<count>\d{1,2})\s+)?(?:a\s+|an\s+|the\s+)?(?:bulk\s+|static\s+|new\s+)?(?:ads?|creatives?|ad\s+creatives?|ad\s+variants?)(?:\s+(?:for|about|on|promoting)\s+(?<topic>.+))?$/,
+    "bulk-creatives",
+  ],
 ];
 const DRY_RUN_RE = /\b(as a draft|draft only|dry run|don'?t publish|do not publish|without publishing)\b/;
 
@@ -140,7 +151,10 @@ function topicCommand(t: string): { skill: string; args: Record<string, unknown>
     if (!m || !ALLOWED_SKILLS.has(skill)) continue;
     const topic = m.groups?.topic?.replace(/\s+(please|jarvis|argus)$/g, "").trim().slice(0, 200);
     const args: Record<string, unknown> = {};
-    if (topic) args.topic = topic;
+    // competitor-intel takes the subject as `brand`; everything else `topic`
+    if (topic) args[skill === "competitor-intel" ? "brand" : "topic"] = topic;
+    const count = Number(m.groups?.count);
+    if (skill === "bulk-creatives" && Number.isInteger(count) && count >= 1 && count <= 30) args.count = count;
     if (dry) args.dry_run = true;
     return { skill, args };
   }
@@ -330,14 +344,21 @@ export function rulesRoute(transcript: string, state: VaultState): RouteResult {
   // otherwise be answered as a question about the wall
   const topic = !isQuestion ? topicCommand(t) : null;
   if (topic) {
-    const what = topic.skill === "ds-blog-publish" ? "the blog post" : "the news carousel";
-    const on = topic.args.topic ? ` on ${topic.args.topic}` : "";
+    const ack: Record<string, [string, string, string]> = {
+      "ds-blog-publish": ["writing and publishing", "the blog post", "I'll read you the link when it's up."],
+      "news-carousel": ["building and posting", "the news carousel", "I'll read you the link when it's up."],
+      "competitor-intel": ["digging into", "the competitor teardown", "I'll tell you what's worth stealing when it's done."],
+      "bulk-creatives": ["writing and rendering", "the ad batch", "I'll shout when the creatives are ready."],
+    };
+    const [verb, what, tail] = ack[topic.skill] ?? ["running", topic.skill.replace(/-/g, " "), "coming up."];
+    const subject = (topic.args.topic ?? topic.args.brand) as string | undefined;
+    const on = subject ? ` on ${subject}` : "";
     const mode = topic.args.dry_run ? " as a draft" : "";
     return {
       tier: 1,
       skill: topic.skill,
       args: topic.args,
-      reply: `On it — ${topic.skill === "ds-blog-publish" ? "writing and publishing" : "building and posting"} ${what}${on}${mode}. ${runnerDownNote(state) ?? "I'll read you the link when it's up."}`,
+      reply: `On it — ${verb} ${what}${on}${mode}. ${runnerDownNote(state) ?? tail}`,
       engine: "rules",
       panels: ["deck", "shipped"],
     };
@@ -400,17 +421,17 @@ function smalltalk(t: string, state: VaultState): string | null {
     return "Loud and clear.";
   }
   if (/\b(thank you|thanks|appreciate it|appreciate you)\b/.test(t)) {
-    return "Anytime.";
+    return "Anytime, man.";
   }
   if (/\b(good ?night|i'?m off|heading to bed|signing off|see you tomorrow)\b/.test(t)) {
-    return "Goodnight. I'll keep watch.";
+    return "Goodnight — I've got things covered here. Sleep well.";
   }
   // bare acks in any short combo: "ok", "okay cool", "nice one argus"
   if (/^((ok(ay)?|cool|nice|got it|sounds good|great|perfect|alright|sweet|then|one|man|jarvis|argus)\s*){1,4}$/.test(t)) {
     return "Standing by.";
   }
   if (/\b(how are you|how'?s it going|how you doing|you good|you doing ok)\b/.test(t)) {
-    return "Running smooth — all systems green. What do you need?";
+    return "I'm good — everything's humming along here. What's up?";
   }
   if (
     /\b(what'?s up|whats up|wassup|what is up)\b/.test(t) ||
@@ -971,7 +992,8 @@ function routerSystem(state: VaultState, convo: string): string {
 {"tier": 1|2|3, "skill": "<skill-name or omit>", "reply": "<short spoken response, max 2 sentences, plain text>", "panels": ["<dashboard panels the reply references, from: ${PANEL_IDS.join(", ")}>"], "args": {<optional intent args, see below>}}
 
 The dashboard is ARGUS, a marketing operating system for Digital Scholar (Indian edtech; currency INR — say "lakh"/"crore", never dollars). The user is a performance-marketing and SEO operator.
-Args: for perf-report and report-deck return "args": {"scope": "meta|google|seo|blended", "range": 7|30|90} inferred from the ask (default blended, 7). For ds-blog-publish and news-carousel return "args": {"topic": "<the subject, verbatim minus the command>"}; add "dry_run": true if they say draft/dry run. Omit args otherwise.
+Voice: ARGUS talks like a close, sharp friend — warm, casual, first person, contractions, plain words. Think "hey, spend's at nineteen eighty already" not "the expenditure currently stands at". Never butler-formal, never corporate, no "certainly/shall I/as requested".
+Args: for perf-report and report-deck return "args": {"scope": "meta|google|seo|blended", "range": 7|30|90} inferred from the ask (default blended, 7). For ds-blog-publish and news-carousel return "args": {"topic": "<the subject, verbatim minus the command>"}; add "dry_run": true if they say draft/dry run. For competitor-intel return "args": {"brand": "<the competitor's name>"}. For bulk-creatives return "args": {"topic": "<the offer/product>", "count": <number of ads if they said one>}; add "dry_run": true for copy-only without rendering. Omit args otherwise.
 
 Tier 1: user wants to RUN one of these skills: ${[...ALLOWED_SKILLS].join(", ")}. Set "skill". Reply = brief ack. ONLY when they want it run or refreshed — asking what's IN a report / what it said / its highlights is tier 2: answer from the recent-runs summaries in the snapshot, do NOT re-run the skill.
 Tier 2: user asks about dashboard state. Answer ONLY from the snapshot below — NEVER invent specifics that aren't in it. If they ask for detail beyond what the snapshot holds (e.g. "which three sponsor emails?" when only a count is listed), that is tier 3: the background session can read the full report. If they ask for the daily briefing / "what's going on today", compose a tight rundown: spend and ROAS vs breakeven, decision queue, budget pacing, open directives.
@@ -1009,6 +1031,16 @@ function sanitizeArgs(raw: unknown, skill: string | undefined): Record<string, u
   }
   if (skill === "ds-blog-publish" || skill === "news-carousel") {
     if (typeof a.topic === "string" && a.topic.trim()) out.topic = a.topic.trim().slice(0, 200);
+    if (a.dry_run === true) out.dry_run = true;
+  }
+  if (skill === "competitor-intel") {
+    const b = a.brand ?? a.topic;
+    if (typeof b === "string" && b.trim()) out.brand = b.trim().slice(0, 120);
+  }
+  if (skill === "bulk-creatives") {
+    if (typeof a.topic === "string" && a.topic.trim()) out.topic = a.topic.trim().slice(0, 200);
+    const n = Number(a.count);
+    if (Number.isInteger(n) && n >= 1 && n <= 30) out.count = n;
     if (a.dry_run === true) out.dry_run = true;
   }
   return Object.keys(out).length ? out : undefined;

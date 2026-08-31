@@ -2,6 +2,17 @@ import fs from "fs";
 import path from "path";
 import { VAULT_ROOT, HUD_TZ } from "./config";
 import { ALLOWED_SKILLS } from "./skills";
+import { readEngagement, type Engagement } from "./engagement";
+
+export type {
+  Engagement,
+  Streaks,
+  StreakState,
+  Quests,
+  QuestItem,
+  Momentum,
+  RecordEntry,
+} from "./engagement";
 
 // ---------------------------------------------------------------------------
 // ARGUS data layer — reads the SAME files the vault cockpit reads.
@@ -294,6 +305,8 @@ export interface VaultState {
   shipped: ShippedEntry[];
   /** skills /api/queue accepts right now — the deck greys out the rest */
   allowed_skills: string[];
+  /** streaks / quests / momentum / records — null only if the engine failed */
+  engagement: Engagement | null;
 }
 
 const HISTORY_CAP = 24;
@@ -756,10 +769,11 @@ export function readMorningReport(max = 4): MorningReport | null {
 // --- consolidated snapshot --------------------------------------------------------
 export function readVaultState(): VaultState {
   const runs = readRecentRuns();
+  const metrics = readMetrics();
   return {
     generated_at: new Date().toISOString(),
     vault_root: VAULT_ROOT,
-    metrics: readMetrics(),
+    metrics,
     runner: readRunnerStatus(),
     daily: readDailyNote(),
     runs,
@@ -769,5 +783,6 @@ export function readVaultState(): VaultState {
     marketing: readMarketing(),
     shipped: shippedFrom(runs),
     allowed_skills: [...ALLOWED_SKILLS],
+    engagement: readEngagement(metrics),
   };
 }

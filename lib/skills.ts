@@ -34,6 +34,12 @@ export const ALLOWED_SKILLS = new Set([
   // publishing — runner spawns these with cwd = the agent project (SKILL_CWD)
   "ds-blog-publish",
   "news-carousel", // rrishijainxCarousel-Final → @rrishijain
+  // competitive intelligence — runner spawns with cwd = the competitor-xray
+  // project; args {brand}. Report lands in inbox/reports/competitors/.
+  "competitor-intel",
+  // bulk static-ad creatives — cwd = the ads-generator-kit project; args
+  // {topic, count, dry_run}. PNGs render via tools/build_ads.py (Gemini).
+  "bulk-creatives",
 ]);
 
 export function writeIntent(

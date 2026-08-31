@@ -248,21 +248,33 @@ const MODE: Record<CoreMode, ModeSpec> = {
 
 const PUPIL_OPEN = 0.18;
 
+// Celebration gold — HSL 46, clearly warmer than SIGNAL's acid yellow-green
+// (oklch hue 116 ≈ HSL ~70) and nowhere near error's sustained red at 12.
+// Reward and alert must never share a colour.
+const CELEB_HUE = 46;
+
 /** demo fallback when nothing is actually playing (key 4 with no audio) */
 function fakeLevel(t: number): number {
   const s = Math.sin(t * 7.3) * 0.5 + Math.sin(t * 11.7) * 0.3 + Math.sin(t * 3.1) * 0.2;
   return Math.min(1, Math.max(0, 0.45 + s * 0.4));
 }
 
-export default function IrisCore({ mode = "idle", bgMode = "depth", getLevel }: CoreProps) {
+function sstep(a: number, b: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+export default function IrisCore({ mode = "idle", bgMode = "depth", getLevel, celebrate }: CoreProps) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const modeRef = useRef<CoreMode>(mode);
   const bgRef = useRef<BgMode>(bgMode);
   const levelRef = useRef<typeof getLevel>(getLevel);
+  const celebrateRef = useRef<CoreProps["celebrate"]>(celebrate ?? null);
   modeRef.current = mode;
   bgRef.current = bgMode;
   levelRef.current = getLevel;
+  celebrateRef.current = celebrate ?? null;
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -323,6 +335,10 @@ export default function IrisCore({ mode = "idle", bgMode = "depth", getLevel }: 
     let level = 0, glow = 1, grain = 0.035, aberr = 0, ripAmp = 0, ripRate = 0, ripPhase = 0;
     let hue = MODE.idle.hue, sat = MODE.idle.sat;
     let shutter = 0, flash = 0, scan = 0, light = 0, gridScroll = 0;
+    // celebration impulse — seq seeded from the mounted prop so an effect
+    // remount (HMR, mode-key remount) never replays a stale celebration
+    let celeb = 0, celebTau = 0.7, celebSat = 0.5;
+    let lastCelebSeq = celebrateRef.current?.seq ?? 0;
     let ratchet = 0, ratchetTarget = 0, ratchetVel = 0, tickAcc = 0;
     let breathT = 0;
     let mx = 0, my = 0, px = 0, py = 0;
@@ -380,6 +396,23 @@ export default function IrisCore({ mode = "idle", bgMode = "depth", getLevel }: 
         if (m === "working") { ratchetTarget = ratchet; tickAcc = 0; }
         prevMode = m;
       }
+
+      // celebration impulse — one-shot, rides ON TOP of whatever mode is
+      // active (the orb may be speaking the congratulation while it blooms).
+      // Tier A ("minor") never reaches the orb; error always wins.
+      const cs = celebrateRef.current;
+      if (cs && cs.seq !== lastCelebSeq) {
+        lastCelebSeq = cs.seq;
+        if (cs.tier !== "minor") {
+          celeb = 1;
+          celebTau = cs.tier === "record" ? 1.5 : 0.7;
+          celebSat = cs.tier === "record" ? 0.62 : 0.5;
+          flash = 1; // reuse the existing bloom impulse
+          if (cs.tier === "record") shutter = 1;
+        }
+      }
+      celeb *= Math.exp(-dt / celebTau);
+      if (m === "error") celeb = 0;
 
       // level: only real while ARGUS is speaking; listening has no mic analyser
       // yet, so it stays 0 until voiceClient grows one — then this tracks it.
@@ -439,8 +472,25 @@ export default function IrisCore({ mode = "idle", bgMode = "depth", getLevel }: 
       hue = (hue + dh * (1 - Math.exp(-dt / hTau)) + 360) % 360;
       sat = ease(sat, spec.sat, hTau, dt);
 
-      const deg = Math.round(hue);
-      const satPct = Math.round(sat * 100);
+      // celebration blend — OUTPUT-ONLY: the eased hue/sat spring above is
+      // never touched, so the decay lands exactly on the mode palette.
+      // 210↔46 crosses green, which the mode easing forbids — here the attack
+      // hides under the flash white-out (hue snaps in two frames) and the
+      // release is sat-gated: saturation collapses first, hue only slides
+      // home once the chrome is near-monochrome, where a hue sweep is
+      // invisible. Because --accent-h/--accent-s are written downstream, the
+      // whole wall swings gold through the same path error-red uses.
+      let outHue = hue;
+      let outSat = sat;
+      if (celeb > 0.001) {
+        const hw = sstep(0.12, 0.35, celeb);
+        outSat = sat + (celebSat - sat) * celeb;
+        const dhC = ((CELEB_HUE - hue + 540) % 360) - 180;
+        outHue = (hue + dhC * hw + 360) % 360;
+      }
+
+      const deg = Math.round(outHue);
+      const satPct = Math.round(outSat * 100);
       if (deg !== lastDeg) {
         lastDeg = deg;
         document.documentElement.style.setProperty("--accent-h", String(deg));
@@ -459,8 +509,8 @@ export default function IrisCore({ mode = "idle", bgMode = "depth", getLevel }: 
       gl.uniform2f(U.u_res, W, H);
       gl.uniform2f(U.u_center, W * 0.5 + px * 6 * dpr, H * 0.568 - py * 6 * dpr);
       gl.uniform1f(U.u_time, t);
-      gl.uniform1f(U.u_hue, hue / 360);
-      gl.uniform1f(U.u_sat, sat);
+      gl.uniform1f(U.u_hue, outHue / 360);
+      gl.uniform1f(U.u_sat, outSat);
       gl.uniform1f(U.u_rotA, rotA);
       gl.uniform1f(U.u_rotB, rotB + ratchet);
       gl.uniform1f(U.u_rotC, rotC);
@@ -468,7 +518,7 @@ export default function IrisCore({ mode = "idle", bgMode = "depth", getLevel }: 
       gl.uniform1f(U.u_curl, curl);
       gl.uniform1f(U.u_bow, 0.9);
       gl.uniform1f(U.u_level, level);
-      gl.uniform1f(U.u_glow, glow);
+      gl.uniform1f(U.u_glow, glow * (1 + 0.4 * celeb));
       gl.uniform1f(U.u_grain, Math.max(0.02, grain));
       gl.uniform1f(U.u_ripAmp, ripAmp);
       gl.uniform1f(U.u_ripFreq, spec.ripFreq);

@@ -23,10 +23,32 @@ export interface Reveal {
 }
 type RevealListener = (r: Reveal) => void;
 
+// "reply" = an answer to something you just asked — never dropped, and it
+// out-ranks background chatter. "ambient" = an unprompted run-completion
+// announcement — capped, deduped, and cut short the moment you ask something.
+type UttKind = "reply" | "ambient";
+
 interface Utterance {
   text: string;
+  kind: UttKind;
   reveals?: Reveal[];
 }
+
+export interface SpeakOpts {
+  reveals?: Reveal[];
+  kind?: UttKind;
+}
+
+// at most this many un-started completion announcements wait in line; a
+// fourth run finishing evicts the oldest instead of adding to the backlog
+const MAX_AMBIENT_QUEUED = 2;
+// cross-tab speech lock — only the tab holding the lead plays audio
+const LEAD_KEY = "argus.voice.lead";
+// stop broadcast — stamping this key silences EVERY tab, lead or not. The
+// panic button for "two voices are talking over each other".
+const STOP_KEY = "argus.voice.stop";
+const LEAD_BEAT_MS = 2000;
+const LEAD_STALE_MS = 6000;
 
 // client-side, so NEXT_PUBLIC_ (inlined at build) — keep in step with
 // VOICE_SERVER_URL in lib/config.ts if you move the voice-server
@@ -63,6 +85,9 @@ class VoiceClient {
   private listeningCb: ListeningListener = () => {};
   private onOpenDocCb: DeliverableListener = () => {};
   private onRevealCb: RevealListener = () => {};
+  private tabId = Math.random().toString(36).slice(2);
+  private leadBeat: ReturnType<typeof setInterval> | null = null;
+  private current: Utterance | null = null;
   private revealTimers: { id: ReturnType<typeof setTimeout>; r: Reveal; fired: boolean }[] = [];
 
   init() {
@@ -80,6 +105,29 @@ class VoiceClient {
     };
     window.addEventListener("pointerdown", unlock);
     window.addEventListener("keydown", unlock);
+
+    // cross-tab speech lock. Two HUD tabs used to speak the same reply at
+    // the same time — the classic "it overlays itself" bug. Only the tab
+    // holding the lead plays audio; touching a tab hands it the lead and
+    // silences the others mid-sentence.
+    const take = () => this.takeLead();
+    window.addEventListener("pointerdown", take);
+    window.addEventListener("keydown", take);
+    window.addEventListener("focus", take);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) this.takeLead();
+    });
+    window.addEventListener("storage", (e) => {
+      // another tab claimed the lead — shut up immediately
+      if (e.key === LEAD_KEY && !this.hasLead()) {
+        this.queue = [];
+        this.currentStop?.();
+      }
+      // another tab hit the stop button — everyone goes quiet, lead included
+      if (e.key === STOP_KEY && e.newValue) this.stop();
+    });
+    window.addEventListener("pagehide", () => this.releaseLead());
+    if (this.leadStale()) this.takeLead(); // first/only tab speaks right away
 
     // config probe — surface a missing key once, up front
     fetch("/api/speak", { cache: "no-store" })
@@ -209,10 +257,94 @@ class VoiceClient {
     this.listeningCb = cb;
   }
 
-  speak(text: string, reveals?: Reveal[]) {
+  // --- cross-tab lead ------------------------------------------------------
+  // localStorage holds {id, ts} for whichever tab owns the voice; the owner
+  // re-stamps ts every LEAD_BEAT_MS so a crashed tab's claim expires instead
+  // of muting the wall forever.
+  private readLead(): { id: string; ts: number } | null {
+    try {
+      const raw = localStorage.getItem(LEAD_KEY);
+      return raw ? (JSON.parse(raw) as { id: string; ts: number }) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private leadStale(): boolean {
+    const l = this.readLead();
+    return !l || Date.now() - l.ts > LEAD_STALE_MS;
+  }
+
+  hasLead(): boolean {
+    if (typeof window === "undefined") return true;
+    const l = this.readLead();
+    if (!l) return false;
+    if (l.id === this.tabId) return true;
+    return Date.now() - l.ts > LEAD_STALE_MS; // holder died — we may speak
+  }
+
+  private stampLead() {
+    try {
+      localStorage.setItem(LEAD_KEY, JSON.stringify({ id: this.tabId, ts: Date.now() }));
+    } catch {}
+  }
+
+  private takeLead() {
+    if (typeof window === "undefined") return;
+    const l = this.readLead();
+    if (l?.id === this.tabId) {
+      this.stampLead();
+      return;
+    }
+    this.stampLead();
+    // heartbeat only while we still hold it — a tab that stamps on past
+    // losing the lead would yank it back every two seconds and the two tabs
+    // would talk over each other again
+    if (!this.leadBeat) {
+      this.leadBeat = setInterval(() => {
+        if (this.readLead()?.id === this.tabId) this.stampLead();
+        else if (this.leadBeat) {
+          clearInterval(this.leadBeat);
+          this.leadBeat = null;
+        }
+      }, LEAD_BEAT_MS);
+    }
+  }
+
+  private releaseLead() {
+    if (this.leadBeat) {
+      clearInterval(this.leadBeat);
+      this.leadBeat = null;
+    }
+    try {
+      if (this.readLead()?.id === this.tabId) localStorage.removeItem(LEAD_KEY);
+    } catch {}
+  }
+
+  speak(text: string, opts: SpeakOpts = {}) {
+    const { reveals, kind = "reply" } = opts;
     const clean = sanitize(text);
     if (!clean || this.disabled) return;
-    this.queue.push({ text: clean, reveals });
+    // a silent tab still logs — it just doesn't play. Whichever tab you last
+    // touched has the lead and does the talking.
+    if (!this.hasLead()) return;
+    // same line twice (double dispatch, a re-delivered run) — say it once
+    if (this.current?.text === clean || this.queue.some((u) => u.text === clean)) return;
+
+    if (kind === "reply") {
+      // you just asked something: pending completion chatter is stale, and a
+      // completion mid-flight yields the floor rather than making you wait
+      this.queue = this.queue.filter((u) => u.kind === "reply");
+      if (this.current?.kind === "ambient") this.currentStop?.();
+    } else {
+      const ambient = this.queue.filter((u) => u.kind === "ambient");
+      if (ambient.length >= MAX_AMBIENT_QUEUED) {
+        const oldest = ambient[0];
+        this.queue = this.queue.filter((u) => u !== oldest);
+      }
+    }
+
+    this.queue.push({ text: clean, kind, reveals });
     if (!this.unlocked) {
       if (!this.announcedLocked) {
         this.announcedLocked = true;
@@ -223,9 +355,21 @@ class VoiceClient {
     void this.drain();
   }
 
+  /** stop() in THIS tab plus a broadcast that silences every other tab —
+   *  the stop button's handler. Covers the overlap case where a tab that
+   *  lost the lead is still finishing an utterance it already started. */
+  stopAll(): boolean {
+    const wasTalking = this.stop();
+    try {
+      localStorage.setItem(STOP_KEY, String(Date.now()));
+    } catch {}
+    return wasTalking;
+  }
+
   /** kill the current utterance AND everything queued behind it */
   stop(): boolean {
     const wasTalking = this.playing || this.queue.length > 0;
+    this.current = null;
     this.queue = [];
     this.clearReveals(false); // barge-in: pending callouts die with the speech
     this.currentStop?.();
@@ -276,6 +420,7 @@ class VoiceClient {
       return false;
     }
     if (this.recorder) return true; // already capturing
+    this.takeLead(); // the tab you talk to is the tab that answers
     this.stop(); // barge-in: opening the mic shuts ARGUS up
     try {
       // keep the stream alive between captures — re-acquiring adds ~200ms
@@ -359,7 +504,7 @@ class VoiceClient {
     }
     if (j.reply) {
       this.log("ok", `argus · ${j.reply}`);
-      this.speak(j.reply, sequenced ? j.reveals : undefined);
+      this.speak(j.reply, { kind: "reply", reveals: sequenced ? j.reveals : undefined });
     }
   }
 
@@ -408,6 +553,7 @@ class VoiceClient {
   private async drain() {
     if (this.playing || this.queue.length === 0 || this.disabled) return;
     const utt = this.queue.shift()!;
+    this.current = utt;
     this.ensureGraph();
     this.setSpeaking(true);
     try {
@@ -422,6 +568,7 @@ class VoiceClient {
         this.log("err", `voice playback failed: ${String(e).slice(0, 120)}`);
       }
     }
+    this.current = null;
     this.setSpeaking(false);
     void this.drain();
   }

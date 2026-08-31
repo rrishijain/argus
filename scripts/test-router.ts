@@ -34,6 +34,7 @@ function state(over: Partial<VaultState> = {}): VaultState {
     marketing: null,
     shipped: [],
     allowed_skills: [],
+    engagement: null,
     ...over,
   };
 }
@@ -142,6 +143,14 @@ const CASES: Case[] = [
   { name: "bare carousel", transcript: "build a carousel", expect: (r) => r.tier === 1 && r.skill === "news-carousel", want: "the only carousel agent left" },
   { name: "news question not a command", transcript: "what is in the news today", expect: (r) => r.tier !== 1 || r.skill !== "news-carousel", want: "question does not publish" },
   { name: "blog question not publish", transcript: "what did the last blog post say", expect: (r) => r.tier !== 1, want: "not dispatched" },
+
+  // --- competitor intel + bulk creatives (Publish deck additions)
+  { name: "competitor intel bare", transcript: "competitor intel", expect: dispatched("competitor-intel"), want: "tier 1 competitor-intel" },
+  { name: "competitor report with brand", transcript: "run a competitor report on upgrad", expect: (r) => r.tier === 1 && r.skill === "competitor-intel" && r.args?.brand === "upgrad", want: "tier 1 competitor-intel + brand" },
+  { name: "competitor question stays put", transcript: "what did the upgrad competitor report find", expect: fallsThrough, want: "fallthrough" },
+  { name: "bulk creatives bare", transcript: "bulk creatives", expect: dispatched("bulk-creatives"), want: "tier 1 bulk-creatives" },
+  { name: "make N ads with topic", transcript: "make 10 ads for the 30 day ai course", expect: (r) => r.tier === 1 && r.skill === "bulk-creatives" && r.args?.topic === "the 30 day ai course" && r.args?.count === 10, want: "tier 1 bulk-creatives topic+count" },
+  { name: "ads question not a render", transcript: "how are the ads doing this week", expect: (r) => !(r.tier === 1 && r.skill === "bulk-creatives"), want: "question does not render ads" },
 
   // --- in-flight guard on the surviving dispatch path
   {

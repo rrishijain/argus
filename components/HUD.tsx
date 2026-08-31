@@ -2,12 +2,14 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
-import type { VaultState } from "@/lib/vault";
+import type { Engagement, RunEntry, VaultState } from "@/lib/vault";
 import { voice } from "@/lib/voiceClient";
+import { sound } from "@/lib/sound";
+import { diffEngagement, type CelebrationEvent } from "@/lib/celebrate";
 import { scrubRunSummary, humanizeFailure } from "@/lib/spokenText";
-import { fmtAgeSeconds } from "@/lib/format";
+import AiNews from "@/components/panels/AiNews";
 import { DEMO_MARKETING } from "@/lib/demo";
-import { BG_MODES, type BgMode, type CoreMode } from "./coreTypes";
+import { BG_MODES, type BgMode, type CelebrateSignal, type CoreMode } from "./coreTypes";
 import ReportOverlay from "./ReportOverlay";
 import PaidMedia from "./panels/PaidMedia";
 import SearchAeo from "./panels/SearchAeo";
@@ -18,7 +20,7 @@ import DecisionQueue from "./panels/DecisionQueue";
 import CommandDeck from "./panels/CommandDeck";
 import { SectionTitle } from "./panels/shared";
 
-const Core = dynamic(() => import("./IrisCore"), { ssr: false });
+const Core = dynamic(() => import("./WireCore"), { ssr: false });
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -90,6 +92,32 @@ function runAnnouncement(skill: string, status: string, summary: string, label?:
   return `${name} is done.${clean && !redundant ? ` ${clean.slice(0, 160)}` : ""}`;
 }
 
+const COUNT_WORD = ["", "one", "two", "three", "four", "five", "six"];
+function runName(r: RunEntry): string {
+  return r.label ? `${r.label} ask` : r.skill.replace(/-/g, " ");
+}
+function listOut(names: string[]): string {
+  if (names.length <= 1) return names[0] ?? "";
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+// Several runs finishing together used to mean several announcements back to
+// back — the wall talking at you for a minute. One line covers the batch; the
+// callout cards carry the detail.
+function batchAnnouncement(runs: RunEntry[]): string {
+  const ok = runs.filter((r) => r.status === "ok");
+  const bad = runs.filter((r) => r.status !== "ok");
+  const parts: string[] = [];
+  if (ok.length > 0) {
+    const n = COUNT_WORD[ok.length] ?? String(ok.length);
+    parts.push(`${n} ${ok.length === 1 ? "run is" : "runs are"} done — ${listOut(ok.map(runName))}.`);
+  }
+  if (bad.length > 0) {
+    parts.push(`${listOut(bad.map(runName))} hit a snag.`);
+  }
+  return parts.join(" ");
+}
+
 // ---------------------------------------------------------------------------
 // panels (memoized — only re-render when their slice of state changes)
 // ---------------------------------------------------------------------------
@@ -114,21 +142,27 @@ const AudioIO = memo(function AudioIO({ mode }: { mode: CoreMode }) {
 const Priorities = memo(function Priorities({
   state,
   hot,
+  flash,
   onToggle,
 }: {
   state: VaultState;
   hot?: boolean;
+  flash?: boolean;
   onToggle: (index: number, done: boolean) => void;
 }) {
   const d = state.daily;
+  const q = state.engagement?.quests ?? null;
   const ageDays = d && !d.isToday ? noteAgeDays(d.date) : 0;
   const veryStale = ageDays > 2;
   return (
     <section
-      className={`block boot-stagger ${!d || d.isToday ? "" : "note-stale"} ${hot ? "voice-hot" : ""}`}
+      className={`block boot-stagger ${!d || d.isToday ? "" : "note-stale"} ${hot ? "voice-hot" : ""} ${flash ? "quest-flash" : ""}`}
       style={{ animationDelay: "0.18s" }}
     >
-      <SectionTitle title="Directives" tick="TOP.3" />
+      <SectionTitle
+        title="Directives"
+        tick={q && q.top3.done > 0 ? `${q.top3.done}/${q.top3.goal}` : "TOP.3"}
+      />
       {d ? (
         <>
           {!d.isToday && (
@@ -136,19 +170,37 @@ const Priorities = memo(function Priorities({
               ⚠ note is {ageDays}d old — run /today
             </div>
           )}
-          {d.top3.map((p, i) => (
-            <div
-              className={`prio ${p.done ? "done" : ""} ${d.isToday ? "clickable" : ""}`}
-              key={i}
-              role={d.isToday ? "button" : undefined}
-              title={d.isToday ? (p.done ? "mark open" : "mark done") : undefined}
-              onClick={d.isToday ? () => onToggle(i, !p.done) : undefined}
-            >
-              <span className="box">{p.done ? "■" : "□"}</span>
-              <span>{p.text}</span>
-            </div>
-          ))}
+          {d.top3.map((p, i) =>
+            // blank template slots ("1. [ ] " with no text) stay out of the
+            // card; index i is the note's own ordering, so toggles still land
+            p.text ? (
+              <div
+                className={`prio ${p.done ? "done" : ""} ${d.isToday ? "clickable" : ""}`}
+                key={i}
+                role={d.isToday ? "button" : undefined}
+                title={d.isToday ? (p.done ? "mark open" : "mark done") : undefined}
+                onClick={d.isToday ? () => onToggle(i, !p.done) : undefined}
+              >
+                <span className="box">{p.done ? "■" : "□"}</span>
+                <span>{p.text}</span>
+              </div>
+            ) : null
+          )}
+          {d.top3.every((p) => !p.text) && (
+            <div className="prio dim">no priorities set — say “today” to start the day</div>
+          )}
           <div className="prio-date">{d.isToday ? "today" : `carried · ${d.date}`}</div>
+          {/* the Daily Drivers quest board — lives in the note already; the
+              wall finally shows it. Display-only (tick them in the note). */}
+          {q && q.drivers.items.length > 0 && (
+            <div className="drivers-row">
+              {q.drivers.items.map((it) => (
+                <span key={it.label} className={`drv ${it.done ? "done" : ""}`}>
+                  <span className="box">{it.done ? "■" : "□"}</span> {it.label}
+                </span>
+              ))}
+            </div>
+          )}
         </>
       ) : (
         <div className="prio dim">no daily note found</div>
@@ -229,38 +281,25 @@ const Schedule = memo(function Schedule({ state, hot }: { state: VaultState; hot
   );
 });
 
-function TopBar({
-  state,
-  online,
-  mode,
-}: {
-  state: VaultState | null;
-  online: boolean;
-  mode: CoreMode;
-}) {
+function greeting(h: number): string {
+  if (h < 5) return "Burning the midnight oil 🌙";
+  if (h < 12) return "Good morning ☀️";
+  if (h < 17) return "Good afternoon 🌤️";
+  if (h < 21) return "Good evening 🌅";
+  return "Good night 🌙";
+}
+
+function TopBar({ state }: { state: VaultState | null }) {
   const now = useClock();
-  const r = state?.runner;
-  const pull = state?.marketing?.pull;
-  const dataCls = !pull ? "dead" : pull.overall === "fresh" ? "on" : pull.overall === "partial" ? "warn" : "dead";
+  const e = state?.engagement;
   return (
     <header className="topbar hud-top boot-stagger" style={{ animationDelay: "0.05s" }}>
       <div className="wordmark">
         <span className="name">ARGUS</span>
         <span className="expansion">Autonomous Reporting &amp; Growth Unified System</span>
       </div>
-      <div className="status-line">
-        <span className={`mode-chip mode-${mode}`}>
-          <i className="status-dot" /> orb · {mode}
-        </span>
-        <span className={`chip ${online ? "on" : "dead"}`}>
-          {online ? "api · online" : "api · LOST"}
-        </span>
-        <span className={`chip ${r?.alive ? "on" : "dead"}`}>
-          runner · {r?.alive ? "alive" : "down"}
-        </span>
-        <span className={`chip ${dataCls}`} title={pull ? `${pull.sources.filter((x) => x.core).map((x) => `${x.source}: ${x.status}`).join(" · ")}` : "no pull yet"}>
-          data · {pull ? `${pull.overall} · ${fmtAgeSeconds(pull.newest_age_s)}` : "none"}
-        </span>
+      <div className="greeting" suppressHydrationWarning>
+        {now ? greeting(now.getHours()) : ""}
       </div>
       <div className="clock-wrap">
         <div className="clock" suppressHydrationWarning>
@@ -282,6 +321,21 @@ function TopBar({
               } ${now.getDate()}`
             : ""}
         </div>
+        {/* THE STREAK — 7-day ship dots + flame count. The today-dot pulses
+            amber only when the streak would die tonight. */}
+        {e && e.streaks.ship.last7.some(Boolean) && (
+          <div
+            className="chain-row"
+            title="7-day streak — one finished run or live publish per day keeps the flame alive"
+          >
+            <span className="chain-dots">
+              {e.streaks.ship.last7.map((on, i) => (
+                <i key={i} className={on ? "on" : i === 6 && e.streaks.ship.atRisk ? "risk" : ""} />
+              ))}
+            </span>
+            <span className="chain-n">🔥 {e.streaks.ship.current}</span>
+          </div>
+        )}
       </div>
     </header>
   );
@@ -298,6 +352,10 @@ const MODE_KEYS: Record<string, CoreMode> = {
   "4": "speaking",
   "5": "error",
 };
+
+// "since you left" digest — last-seen stamp, refreshed every poll (≤5s stale)
+const LAST_SEEN_KEY = "argus.lastSeen.v1";
+const DIGEST_AFTER_MS = 4 * 3_600_000; // away ≥4h earns a digest
 
 export default function HUD() {
   const { state, error, refresh } = useVaultState(5000);
@@ -350,6 +408,15 @@ export default function HUD() {
   const seenAlertsRef = useRef<Set<string>>(new Set());
   const calloutsRef = useRef<typeof callouts>([]);
   calloutsRef.current = callouts;
+
+  // celebrations — orb impulse + per-panel gold shimmer + chime state
+  const [celebrate, setCelebrate] = useState<CelebrateSignal | null>(null);
+  const celebSeqRef = useRef(0);
+  const [flashPanels, setFlashPanels] = useState<string[]>([]);
+  const [chimesMuted, setChimesMuted] = useState(false);
+  const engPrimedRef = useRef(false);
+  const prevEngRef = useRef<Engagement | null>(null);
+  const lastSeenDoneRef = useRef(false);
 
   // the old telemetry feed is gone from the wall; keep a console trail so voice
   // + runner events are still debuggable from devtools
@@ -466,6 +533,8 @@ export default function HUD() {
   // voice link — P1: ARGUS speaks, no mic
   useEffect(() => {
     voice.init();
+    sound.init();
+    setChimesMuted(sound.muted);
     voice.onLog(pushLine);
     voice.onPanels(setHotPanels);
     voice.onDeliverable((path, label) => addCallout(path, label));
@@ -519,7 +588,7 @@ export default function HUD() {
           setReport(null);
           return;
         }
-        if (voice.stop()) pushLine("sys", "voice — stopped");
+        if (voice.stopAll()) pushLine("sys", "voice — stopped");
         setModeOverride(null);
       } else if (e.key === "0") {
         setModeOverride(null);
@@ -530,6 +599,16 @@ export default function HUD() {
           pushLine("sys", `background → ${next.toUpperCase()}`);
           return next;
         });
+      } else if (e.key === "6" || e.key === "7") {
+        // celebration demo/tuning — 6 major, 7 record
+        const tier = e.key === "6" ? ("major" as const) : ("record" as const);
+        setCelebrate({ seq: ++celebSeqRef.current, tier });
+        sound.play(tier === "record" ? "record" : "quest");
+        pushLine("sys", `celebration demo → ${tier.toUpperCase()}`);
+      } else if (e.key === "m" || e.key === "M") {
+        const muted = sound.toggleMute();
+        setChimesMuted(muted);
+        pushLine("sys", `chimes → ${muted ? "MUTED" : "ON"}`);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -643,9 +722,9 @@ export default function HUD() {
       done.forEach((r) => spokenRunsRef.current.add(r.id));
       return;
     }
+    // cards pop per run — it's the SPEECH that gets coalesced below
     done.forEach((r) => {
       spokenRunsRef.current.add(r.id);
-      voice.speak(runAnnouncement(r.skill, r.status, r.summary ?? "", r.label));
       // finished run left a document → offer it via the reveal chip. When
       // the run's REAL output lives at a URL (Gmail draft, video), the
       // callout sends you THERE — the md stays in the Documents trail.
@@ -657,7 +736,96 @@ export default function HUD() {
         );
       }
     });
+
+    // a voice-ask summary IS the answer to something you asked out loud, so
+    // each one is spoken in full and ranks as a reply. Every other completion
+    // is background news: one landing speaks normally, three landing together
+    // speak once.
+    const asks = done.filter((r) => r.skill === "voice-ask" && r.status === "ok");
+    const news = done.filter((r) => !(r.skill === "voice-ask" && r.status === "ok"));
+    asks.forEach((r) =>
+      voice.speak(runAnnouncement(r.skill, r.status, r.summary ?? "", r.label), { kind: "reply" })
+    );
+    if (news.length === 1) {
+      const r = news[0];
+      voice.speak(runAnnouncement(r.skill, r.status, r.summary ?? "", r.label), { kind: "ambient" });
+    } else if (news.length > 1) {
+      voice.speak(batchAnnouncement(news), { kind: "ambient" });
+    }
   }, [state]);
+
+  // fire one celebration: minor = panel shimmer + tick; major/record also
+  // pulse the orb (gold swing runs through IrisCore, never CSS), speak one
+  // ambient line, and — for records — pop the NEW RECORD callout
+  const fireCelebration = useCallback(
+    (ev: CelebrationEvent) => {
+      if (ev.panel) {
+        setFlashPanels((cur) => (cur.includes(ev.panel!) ? cur : [...cur, ev.panel!]));
+      }
+      sound.play(ev.tier === "record" ? "record" : ev.tier === "major" ? "quest" : "tick");
+      if (ev.tier !== "minor") {
+        setCelebrate({ seq: ++celebSeqRef.current, tier: ev.tier });
+        if (ev.line) voice.speak(ev.line, { kind: "ambient" });
+        if (ev.callout) addCallout(ev.callout.target, ev.callout.label);
+      }
+    },
+    [addCallout]
+  );
+
+  // one-shot shimmer lifecycle — same shape as the voice-hot grace timer
+  useEffect(() => {
+    if (flashPanels.length === 0) return;
+    const id = setTimeout(() => setFlashPanels([]), 1400);
+    return () => clearTimeout(id);
+  }, [flashPanels]);
+
+  // celebrations — pure diff between consecutive SAME-DAY engagement
+  // snapshots. First snapshot primes silently (runsPrimedRef pattern); a
+  // date rollover re-primes, so the midnight quest reset can never fire as
+  // a "win". The chain-at-risk chime rides the evening transition, once.
+  useEffect(() => {
+    const eng = state?.engagement;
+    if (!eng) return;
+    const prev = prevEngRef.current;
+    prevEngRef.current = eng;
+    if (!engPrimedRef.current || !prev || prev.date !== eng.date) {
+      engPrimedRef.current = true;
+      return;
+    }
+    if (eng.streaks.ship.atRisk && !prev.streaks.ship.atRisk) sound.play("risk");
+    const dash = state?.marketing?.latest_reports.dashboard ?? "ops/ads-dashboard.md";
+    diffEngagement(prev, eng, dash).forEach(fireCelebration);
+  }, [state, fireCelebration]);
+
+  // "since you left" — the open dopamine hit: one digest callout when you
+  // return after ≥4h away, different every time. First-ever visit stamps
+  // silently. state.runs holds only the last 8 — plenty for a digest line.
+  useEffect(() => {
+    if (!state) return;
+    if (!lastSeenDoneRef.current) {
+      lastSeenDoneRef.current = true;
+      try {
+        const raw = localStorage.getItem(LAST_SEEN_KEY);
+        const last = raw ? parseInt(raw, 10) : NaN;
+        if (Number.isFinite(last) && Date.now() - last > DIGEST_AFTER_MS) {
+          const runsDone = state.runs.filter(
+            (r) => r.status === "ok" && r.ts_completed && Date.parse(r.ts_completed) > last
+          ).length;
+          const shipped = state.shipped.filter((s) => s.ts && Date.parse(s.ts) > last).length;
+          if (runsDone > 0) {
+            const bits = [`${runsDone} ${runsDone === 1 ? "run" : "runs"}`];
+            if (shipped > 0) bits.push(`${shipped} shipped`);
+            const dash = state.marketing?.latest_reports.dashboard ?? "ops/ads-dashboard.md";
+            addCallout(`${dash}#while-you-were-out`, `while you were out · ${bits.join(" · ")}`);
+            voice.speak(`While you were out: ${bits.join(", ")}.`, { kind: "ambient" });
+          }
+        }
+      } catch {}
+    }
+    try {
+      localStorage.setItem(LAST_SEEN_KEY, String(Date.now()));
+    } catch {}
+  }, [state, addCallout]);
 
   const onQueued = useCallback(
     (skill: string, ok: boolean) => {
@@ -683,15 +851,10 @@ export default function HUD() {
 
   return (
     <main className="stage">
-      <Core mode={mode} bgMode={bgMode} getLevel={voice.getLevel} />
-
-      <div className="scrim scrim-l" aria-hidden="true" />
-      <div className="scrim scrim-r" aria-hidden="true" />
-      <div className="scrim scrim-b" aria-hidden="true" />
-      <div className="scrim scrim-t" aria-hidden="true" />
+      <Core mode={mode} bgMode={bgMode} getLevel={voice.getLevel} celebrate={celebrate} />
 
       <div className="hud">
-        <TopBar state={state} online={!error} mode={mode} />
+        <TopBar state={state} />
 
         <div className="hud-left">
           <PaidMedia m={state?.marketing ?? null} hot={hotPanels.includes("paid") || hotPanels.includes("vitals")} />
@@ -700,10 +863,12 @@ export default function HUD() {
             <Priorities
               state={state}
               hot={hotPanels.includes("priorities")}
+              flash={flashPanels.includes("priorities")}
               onToggle={toggleDirective}
             />
           )}
           {state && <Schedule state={state} hot={hotPanels.includes("schedule")} />}
+          <AiNews hot={hotPanels.includes("news")} />
         </div>
 
         <div className="hud-center">
@@ -793,7 +958,18 @@ export default function HUD() {
             onQueued={onQueued}
           />
           <Sources m={state?.marketing ?? null} hot={hotPanels.includes("sources")} onOpen={openReport} />
-          <Shipped items={state?.shipped ?? []} hot={hotPanels.includes("shipped") || hotPanels.includes("documents")} onOpen={openReport} />
+          <Shipped
+            items={state?.shipped ?? []}
+            quests={state?.engagement?.quests ?? null}
+            record={
+              state?.engagement?.records.find((r) => r.brokenToday) ??
+              state?.engagement?.records.find((r) => r.nearMiss) ??
+              null
+            }
+            hot={hotPanels.includes("shipped") || hotPanels.includes("documents")}
+            flash={flashPanels.includes("shipped")}
+            onOpen={openReport}
+          />
           <AudioIO mode={mode} />
           {state && <Wire state={state} onOpen={openReport} />}
         </div>
@@ -805,6 +981,23 @@ export default function HUD() {
 
         <button className="transcript-btn" onClick={() => void openTranscript()}>
           Transcript
+        </button>
+        <button
+          className={`voice-stop-btn ${voiceSpeaking ? "talking" : ""}`}
+          title="Stop all speech, every tab (Esc)"
+          onClick={() => {
+            voice.stopAll();
+            pushLine("sys", "voice — stopped");
+          }}
+        >
+          ■ Stop Voice
+        </button>
+        <button
+          className={`sound-btn ${chimesMuted ? "muted" : ""}`}
+          title="Celebration chimes on/off (M)"
+          onClick={() => setChimesMuted(sound.toggleMute())}
+        >
+          {chimesMuted ? "♪ off" : "♪ on"}
         </button>
       </div>
 
@@ -828,7 +1021,6 @@ export default function HUD() {
         />
       )}
 
-      <div className="grain" aria-hidden="true" />
     </main>
   );
 }
