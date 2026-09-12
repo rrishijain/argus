@@ -9,7 +9,7 @@ const nextConfig = {
   outputFileTracingRoot: __dirname,
   // no eslint setup in this repo (quality gates = tsc + npm test); Next's
   // built-in build lint fails on react-compiler-prep rules (refs-in-render in
-  // the three.js cores, Date.now() in HUD render) that are deliberate here.
+  // the three.js cores, Date.now() in console render) that are deliberate here.
   // A real eslint config is distribution-repo work.
   eslint: { ignoreDuringBuilds: true },
 };

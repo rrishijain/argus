@@ -3,7 +3,7 @@
 import { memo } from "react";
 import type { Marketing, PullSource } from "@/lib/vault";
 import { fmtAgeSeconds } from "@/lib/format";
-import { SectionTitle } from "./shared";
+import { PanelLoading, SectionTitle, pressable } from "./shared";
 
 // ---------------------------------------------------------------------------
 // Sources — "can I trust this number?" in one glance. One chip per data
@@ -27,8 +27,15 @@ function glyph(s: PullSource): string {
   }
 }
 
-const Sources = memo(function Sources({ m, hot, onOpen }: { m: Marketing | null; hot?: boolean; onOpen?: (p: string) => void }) {
-  if (!m) return null;
+const Sources = memo(function Sources({ m, hot, loading, onOpen }: { m: Marketing | null; hot?: boolean; loading?: boolean; onOpen?: (p: string) => void }) {
+  if (!m) {
+    return (
+      <section className={`block accent-sky boot-stagger ${hot ? "voice-hot" : ""}`} style={{ animationDelay: "0.34s" }}>
+        <SectionTitle title="Sources" tick={loading ? "LOADING" : "NO PULL YET"} tickCls="dim" />
+        {loading ? <PanelLoading /> : <div className="prio dim">waiting on the first metrics pull</div>}
+      </section>
+    );
+  }
   const ORDER = ["meta_ads", "google_ads", "gsc", "aeo", "instagram", "youtube", "tiktok", "claude_code"];
   const srcs = [...m.pull.sources].sort(
     (a, b) => (ORDER.indexOf(a.source) + 1 || 99) - (ORDER.indexOf(b.source) + 1 || 99)
@@ -37,14 +44,14 @@ const Sources = memo(function Sources({ m, hot, onOpen }: { m: Marketing | null;
   const latest = m.latest_reports.metrics;
   return (
     <section
-      className={`block boot-stagger ${hot ? "voice-hot" : ""}`}
+      className={`block accent-sky boot-stagger ${hot ? "voice-hot" : ""}`}
       style={{ animationDelay: "0.34s" }}
-      role={latest && onOpen ? "button" : undefined}
-      onClick={latest && onOpen ? () => onOpen(latest) : undefined}
+      title={latest && onOpen ? "open the latest metrics-pull report" : undefined}
+      {...(latest && onOpen ? pressable(() => onOpen(latest)) : {})}
     >
       <SectionTitle
         title="Sources"
-        tick={`DATA · ${overall.toUpperCase()} · ${fmtAgeSeconds(m.pull.newest_age_s)}`}
+        tick={`DATA · ${overall.toUpperCase()} · CHECK ${fmtAgeSeconds(m.pull.newest_age_s)}`}
         tickCls={overall === "fresh" ? "" : overall === "partial" ? "warn" : "bad"}
       />
       <div className="src-strip">
@@ -52,7 +59,7 @@ const Sources = memo(function Sources({ m, hot, onOpen }: { m: Marketing | null;
           <span
             key={s.source}
             className={`src-chip st-${s.status} ${s.core ? "core" : ""}`}
-            title={s.error || s.status}
+            title={`${s.status}${s.error ? `: ${s.error}` : ""} · Last check: ${s.ts ?? "unknown"}. Check time is not the date range of the underlying data.`}
           >
             <i>{glyph(s)}</i>
             {NAMES[s.source] ?? s.source.toUpperCase()}

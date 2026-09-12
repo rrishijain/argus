@@ -1,5 +1,5 @@
 """Dev probe — connect to ws://:3108/events and print events for N seconds.
-Used to verify the wake pipeline without a HUD tab open. Not part of the server."""
+Used to verify the wake pipeline without a console tab open. Not part of the server."""
 import asyncio
 import sys
 

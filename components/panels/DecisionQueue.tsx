@@ -3,7 +3,7 @@
 import { memo } from "react";
 import type { Campaign, Marketing } from "@/lib/vault";
 import { fmtINR, fmtINRShort, fmtRoas } from "@/lib/format";
-import { SectionTitle } from "./shared";
+import { SectionTitle, pressable } from "./shared";
 
 // ---------------------------------------------------------------------------
 // Decision Queue — the top campaign verdicts (KILL → FIX → SCALE) from
@@ -45,9 +45,8 @@ const DecisionQueue = memo(function DecisionQueue({
     <section
       className={`block decisions boot-stagger ${hot ? "voice-hot" : ""}`}
       style={{ animationDelay: "0.66s" }}
-      role="button"
-      onClick={() => onOpen(dash)}
       title="open the marketing dashboard"
+      {...pressable(() => onOpen(dash))}
     >
       <SectionTitle title="Decision Queue" tick={tick} tickCls={kills ? "bad" : fixes ? "warn" : ""} />
       {!m ? (

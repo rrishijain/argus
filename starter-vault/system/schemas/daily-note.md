@@ -6,7 +6,7 @@ status: frozen
 
 # Daily Note Schema
 
-Frozen contract shared by the HUD parser (`lib/vault.ts`), the runner's
+Frozen contract shared by the console parser (`lib/vault.ts`), the runner's
 plan-today / plan-tomorrow prompts, and anything else that writes daily
 notes. Breaking changes bump `schema_version`; parsers refuse unknown
 versions rather than silently coercing.
@@ -46,14 +46,14 @@ focus: ""             # optional, one line
 
 ## Current Focus
 
-One line. The HUD speaks this in the daily rundown.
+One line. The console speaks this in the daily rundown.
 
 ## Notes
 
 Freeform — not parsed.
 ```
 
-Parser specifics the HUD relies on:
+Parser specifics the console relies on:
 - Top 3 items are NUMBERED checkboxes (`1. [ ]` / `1. [x]`) — the
   Directives panel toggles them via `/api/daily`.
 - Schedule bullets are `- HH:MM — title` (em/en dash or hyphen).

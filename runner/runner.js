@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 /**
- * ARGUS Runner — background skill executor for the ARGUS HUD.
+ * ARGUS Runner — background skill executor for the ARGUS console.
  *
  * Watches `<vault>/system/queue/<uuid>.json`, processes intents, shells
  * `claude -p "<prompt>"`, writes `system/runs/<uuid>.json` + `<uuid>.md`.
- * The HUD writes intents (buttons + voice); this daemon does the work.
+ * The console writes intents (buttons + voice); this daemon does the work.
  *
  * Run it: `node runner/runner.js` (or start-runner.vbs hidden at login).
  * Crash-safe: logs uncaught exceptions. No external deps — Node 20+.
  *
  * ADDING A SKILL: add a case to deliverablePathFor() + buildPrompt(), then
- * add the same name to ALLOWED_SKILLS in lib/skills.ts (the HUD refuses
+ * add the same name to ALLOWED_SKILLS in lib/skills.ts (the console refuses
  * skills it doesn't know). Keep the SPOKEN SUMMARY CONTRACT preamble — the
  * first line of the claude reply is read aloud by the voice layer.
  */
@@ -24,11 +24,15 @@ import {
   writeFileSync,
   unlinkSync,
   appendFileSync,
+  appendFile,
+  renameSync,
+  statSync,
 } from "node:fs";
 import { join, basename, dirname } from "node:path";
 import { homedir, platform } from "node:os";
 import { fileURLToPath } from "node:url";
 import { watch } from "node:fs/promises";
+import { creativeBriefContext, creativeGeminiEnvironment } from "./creative-brief.js";
 
 const RUNNER_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -58,10 +62,17 @@ const env = (k) => process.env[k] || _env[k];
 
 const VAULT_ROOT =
   env("VAULT_ROOT") || env("AGENTIC_OS_VAULT") || join(RUNNER_DIR, "..", "starter-vault");
-// MUST match HUD_TZ in lib/config.ts — "today" has to mean the same day in
+// MUST match CONSOLE_TZ in lib/config.ts — "today" has to mean the same day in
 // both places or daily notes split across two dates near midnight UTC.
-const HUD_TZ = env("HUD_TZ") || "America/Chicago";
+const CONSOLE_TZ = env("CONSOLE_TZ") || env("HUD_TZ") || "America/Chicago";
 const QUEUE_DIR = join(VAULT_ROOT, "system", "queue");
+// Claimed intents live here while a child runs — the atomic rename OUT of
+// QUEUE_DIR is the claim, so a second runner (or a restart) can never
+// double-execute the same intent. Abandoned files are reconciled at boot.
+const PROCESSING_DIR = join(QUEUE_DIR, "processing");
+const PENDING_DIR = join(QUEUE_DIR, "pending-approval");
+// Invalid or abandoned intents are quarantined here with a .note.txt.
+const FAILED_DIR = join(QUEUE_DIR, "failed");
 const RUNS_DIR = join(VAULT_ROOT, "system", "runs");
 const STATUS_FILE = join(VAULT_ROOT, "system", "runner-status.json");
 const RUNNER_LOG = join(RUNNER_DIR, "runner.log");
@@ -89,7 +100,7 @@ const SCOPES = new Set(["meta", "google", "seo", "blended"]);
 const RANGES = new Set([7, 30, 90]);
 const argScope = (args) => (SCOPES.has(args?.scope) ? args.scope : "blended");
 const argRange = (args) => (RANGES.has(Number(args?.range)) ? Number(args.range) : 7);
-const HUD_PUBLIC_URL = env("HUD_PUBLIC_URL") || "http://localhost:3107";
+const CONSOLE_PUBLIC_URL = env("CONSOLE_PUBLIC_URL") || env("HUD_PUBLIC_URL") || "http://localhost:3107";
 
 // --- publishing skills run INSIDE their own Claude Code project -------------
 // ds-blog-publish / news-carousel need that project's CLAUDE.md, rules,
@@ -138,22 +149,38 @@ const TIMEOUT_MIN = {
   // copy for N angles → brief → render N×2 images via Gemini → note
   "bulk-creatives": 60,
 };
-// Live-publish caps per HUD_TZ day, enforced here (a prompt can be talked
+// Live-publish caps per CONSOLE_TZ day, enforced here (a prompt can be talked
 // around; the runner can't). dry_run intents don't count.
 const DAILY_CAP = { "ds-blog-publish": 2, "news-carousel": 1 };
+const PUBLISH_APPROVAL = ["1", "true"].includes(env("PUBLISH_APPROVAL"));
 const LEDGER_FILE = join(VAULT_ROOT, "system", "publish-ledger.json");
 const LEDGER_KIND = { "ds-blog-publish": "blog", "news-carousel": "news-carousel" };
 
+// Returns the count of live publishes today, or null when the ledger cannot
+// be trusted. ONLY a missing file (ENOENT) counts as an empty ledger —
+// malformed JSON, permission errors etc. must BLOCK publishing (fail closed),
+// otherwise a corrupt ledger silently disables the daily cap.
 function publishedToday(kind) {
+  let data;
   try {
-    const data = JSON.parse(readFileSync(LEDGER_FILE, "utf8"));
+    data = JSON.parse(readFileSync(LEDGER_FILE, "utf8"));
+  } catch (e) {
+    if (e?.code === "ENOENT") return 0;
+    log(
+      `LEDGER ERROR: cannot read/parse ${LEDGER_FILE} (${e.message}) — ` +
+        `publish cap unverifiable, BLOCKING publish jobs until the ledger is fixed`
+    );
+    return null;
+  }
+  try {
     const today = todayDate();
     return (data.entries || []).filter(
       (e) => e.kind === kind && !e.dry_run &&
-        new Intl.DateTimeFormat("en-CA", { timeZone: HUD_TZ }).format(new Date(e.ts)) === today
+        new Intl.DateTimeFormat("en-CA", { timeZone: CONSOLE_TZ }).format(new Date(e.ts)) === today
     ).length;
-  } catch {
-    return 0;
+  } catch (e) {
+    log(`LEDGER ERROR: unreadable entries in ${LEDGER_FILE} (${e.message}) — BLOCKING publish jobs`);
+    return null;
   }
 }
 
@@ -163,9 +190,18 @@ function modelFor(intent) {
   return SKILL_MODEL[intent?.skill] || CLAUDE_MODEL;
 }
 
+// Atomic write — tmp file + rename in the same dir, so readers (the console polls
+// these JSON files) never see a truncated half-write.
+function writeFileAtomic(path, data) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, data, "utf8");
+  renameSync(tmp, path);
+}
+
+let heartbeatFailures = 0;
 function writeHeartbeat() {
   try {
-    writeFileSync(
+    writeFileAtomic(
       STATUS_FILE,
       JSON.stringify(
         {
@@ -182,23 +218,39 @@ function writeHeartbeat() {
         2
       ) + "\n"
     );
+    heartbeatFailures = 0;
+  } catch (e) {
+    // Don't swallow silently — a dead heartbeat looks like a dead runner to
+    // the console. Log the first failure and then every 20th to avoid spam.
+    heartbeatFailures++;
+    if (heartbeatFailures === 1 || heartbeatFailures % 20 === 0) {
+      log(`heartbeat write failed x${heartbeatFailures}: ${e.message}`);
+    }
+  }
+}
+
+// runner.log rotation — rotate at 5MB, keep one .old.
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+function rotateLogIfNeeded() {
+  try {
+    if (statSync(RUNNER_LOG).size >= LOG_MAX_BYTES) {
+      renameSync(RUNNER_LOG, `${RUNNER_LOG}.old`);
+    }
   } catch {
-    /* ignore */
+    /* ENOENT / racing rotation — ignore */
   }
 }
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
-  try {
-    appendFileSync(RUNNER_LOG, line, "utf8");
-  } catch {
-    /* ignore */
-  }
+  rotateLogIfNeeded();
+  // async append — keep log I/O off the event loop's critical path
+  appendFile(RUNNER_LOG, line, "utf8", () => {});
   console.log(line.trimEnd());
 }
 
 function ensureDirs() {
-  for (const d of [QUEUE_DIR, RUNS_DIR]) {
+  for (const d of [QUEUE_DIR, PROCESSING_DIR, PENDING_DIR, FAILED_DIR, RUNS_DIR]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
   }
 }
@@ -208,7 +260,7 @@ function readJson(path) {
 }
 
 function writeJson(path, obj) {
-  writeFileSync(path, JSON.stringify(obj, null, 2) + "\n", "utf8");
+  writeFileAtomic(path, JSON.stringify(obj, null, 2) + "\n");
 }
 
 function slugify(s, max = 48) {
@@ -221,9 +273,9 @@ function slugify(s, max = 48) {
 }
 
 function todayDate() {
-  // Local (HUD_TZ) YYYY-MM-DD. toISOString() returns UTC, which flips to
+  // Local (CONSOLE_TZ) YYYY-MM-DD. toISOString() returns UTC, which flips to
   // tomorrow's date in the evening for western timezones — wrong for "today".
-  return new Intl.DateTimeFormat("en-CA", { timeZone: HUD_TZ }).format(new Date());
+  return new Intl.DateTimeFormat("en-CA", { timeZone: CONSOLE_TZ }).format(new Date());
 }
 
 function tomorrowDate() {
@@ -235,7 +287,7 @@ function tomorrowDate() {
 
 /**
  * Per-skill deliverable path inside the vault — where the user-facing
- * artifact lands. The HUD's Documents panel + doc callouts deep-link here.
+ * artifact lands. The console's Documents panel + doc callouts deep-link here.
  */
 function deliverablePathFor(intent) {
   const id8 = (intent.id || "x").slice(0, 8);
@@ -282,7 +334,7 @@ function deliverablePathFor(intent) {
       return `inbox/reports/perf/${date}-${argScope(args)}-${argRange(args)}d-${id8}.md`;
     case "report-deck":
       return `inbox/reports/decks/${date}-${argScope(args)}-${argRange(args)}d-${id8}.md`;
-    // publishing (inbox/ prefix is required for the HUD to honour `link:`)
+    // publishing (inbox/ prefix is required for the console to honour `link:`)
     case "ds-blog-publish":
       return `inbox/reports/publish/${date}-blog-${slugify(args.topic || "next-from-backlog", 40)}-${id8}.md`;
     case "news-carousel":
@@ -317,11 +369,11 @@ function buildPrompt(intent, deliverable) {
 
   switch (skill) {
     case "plan-today":
-      return `${AUTONOMOUS_PREFIX}\n\nTask: plan today's daily note at exactly ${deliverable}.\n\nSteps:\n1. Read the last 3 daily notes under daily-notes/ for incomplete Top 3 priorities and reflections (carryover candidates).\n2. If a Google Calendar MCP connector is available, pull today's events (timeZone=${HUD_TZ}, sorted by start time). If not, skip the schedule.\n3. Scan projects/*.md (if the folder exists) for active or due items.\n4. Pick the 3 highest-leverage priorities: carryover from yesterday beats new, due-today beats someday.\n5. Write the daily note following the schema at system/schemas/daily-note.md — exact section order. If the note already exists, MERGE: fill only empty Top 3 slots and replace ## Schedule; never overwrite user-set text.\n\nEnd your reply with: SAVED ${deliverable}`;
+      return `${AUTONOMOUS_PREFIX}\n\nTask: plan today's daily note at exactly ${deliverable}.\n\nSteps:\n1. Read the last 3 daily notes under daily-notes/ for incomplete Top 3 priorities and reflections (carryover candidates).\n2. If a Google Calendar MCP connector is available, pull today's events (timeZone=${CONSOLE_TZ}, sorted by start time). If not, skip the schedule.\n3. Scan projects/*.md (if the folder exists) for active or due items.\n4. Pick the 3 highest-leverage priorities: carryover from yesterday beats new, due-today beats someday.\n5. Write the daily note following the schema at system/schemas/daily-note.md — exact section order. If the note already exists, MERGE: fill only empty Top 3 slots and replace ## Schedule; never overwrite user-set text.\n\nEnd your reply with: SAVED ${deliverable}`;
     case "plan-tomorrow":
-      return `${AUTONOMOUS_PREFIX}\n\nTask: draft tomorrow's daily note at exactly ${deliverable}.\n\nSteps:\n1. Read today's daily note for unfinished Top 3 priorities (carryover).\n2. If a Google Calendar MCP connector is available, pull tomorrow's events (timeZone=${HUD_TZ}).\n3. Suggest 3 priorities for tomorrow.\n4. Write the note following the schema at system/schemas/daily-note.md.\n\nEnd your reply with: SAVED ${deliverable}`;
+      return `${AUTONOMOUS_PREFIX}\n\nTask: draft tomorrow's daily note at exactly ${deliverable}.\n\nSteps:\n1. Read today's daily note for unfinished Top 3 priorities (carryover).\n2. If a Google Calendar MCP connector is available, pull tomorrow's events (timeZone=${CONSOLE_TZ}).\n3. Suggest 3 priorities for tomorrow.\n4. Write the note following the schema at system/schemas/daily-note.md.\n\nEnd your reply with: SAVED ${deliverable}`;
     case "morning-report":
-      return `${AUTONOMOUS_PREFIX}\n\nTask: produce today's AI/tech morning briefing and save it at exactly ${deliverable}.\n\nResearch the last ~24 hours via web search (model releases, agent tooling, dev-tool launches, the conversation on X/HN). Structure the note: top-level "# Morning Report" + "**Date:** <today>", then "## Headlines" (3-5 bullets ranked by impact; each bullet MUST end with a markdown link to its primary source, e.g. [source](https://...)), "## Web — News & Articles", "## X / Twitter — The Conversation", "## GitHub — Builder Activity", "## Sources". YAML frontmatter: \`date\`, \`skill: morning-report\`, \`tags: [morning, briefing]\`.\n\nThe HUD's AI Wire panel and the spoken daily brief both read the ## Headlines section — keep those bullets tight.\n\nEnd your reply with: SAVED ${deliverable}`;
+      return `${AUTONOMOUS_PREFIX}\n\nTask: produce today's AI/tech morning briefing and save it at exactly ${deliverable}.\n\nResearch the last ~24 hours via web search (model releases, agent tooling, dev-tool launches, the conversation on X/HN). Structure the note: top-level "# Morning Report" + "**Date:** <today>", then "## Headlines" (3-5 bullets ranked by impact; each bullet MUST end with a markdown link to its primary source, e.g. [source](https://...)), "## Web — News & Articles", "## X / Twitter — The Conversation", "## GitHub — Builder Activity", "## Sources". YAML frontmatter: \`date\`, \`skill: morning-report\`, \`tags: [morning, briefing]\`.\n\nThe console's AI Wire panel and the spoken daily brief both read the ## Headlines section — keep those bullets tight.\n\nEnd your reply with: SAVED ${deliverable}`;
     case "inbox-brief":
       return `${AUTONOMOUS_PREFIX}\n\nTask: triage the Gmail inbox and save the brief at exactly ${deliverable}.\n\nSteps:\n1. Pull the last 24h via the Anthropic Gmail MCP connector — mcp__claude_ai_Gmail__search_threads with query "in:inbox newer_than:1d", pageSize 50. If the connector is unavailable, write a short note saying so and stop.\n2. Classify each thread: urgent (deadlines, money, blocked people) / warm (real humans worth replying to) / opportunities (sponsorships, partnerships) / meetings / noise.\n3. Save the triage at ${deliverable}. YAML frontmatter \`date\`, \`skill: inbox-brief\`, \`tags: [inbox, triage]\`. Body groups messages by category, most urgent first.\n4. Do NOT send anything — drafting and sending stay manual.\n\nEnd your reply with: SAVED ${deliverable}`;
     case "vault-cleanup":
@@ -340,11 +392,11 @@ function buildPrompt(intent, deliverable) {
     // can invoke them. Each prompt still pins the deliverable path so the
     // Documents panel and the spoken summary have something to open.
     case "today":
-      return `${AUTONOMOUS_PREFIX}\n\nTask: run the /today skill — Rishi's start-of-day routine — for ${todayDate()} (timezone ${HUD_TZ}).\n\nThe skill creates today's daily note from the frozen schema, carries over yesterday's unchecked Top 3, and pulls Google Calendar events via the Anthropic connector. It is idempotent: if the note already exists, MERGE — fill only empty slots and refresh the schedule, never overwrite text the user wrote. If the Calendar connector is unavailable, skip the schedule and say so in the note.\n\nThe daily note is at exactly ${deliverable}.\n\nEnd your reply with: SAVED ${deliverable}`;
+      return `${AUTONOMOUS_PREFIX}\n\nTask: run the /today skill — Rishi's start-of-day routine — for ${todayDate()} (timezone ${CONSOLE_TZ}).\n\nThe skill creates today's daily note from the frozen schema, carries over yesterday's unchecked Top 3, and pulls Google Calendar events via the Anthropic connector. It is idempotent: if the note already exists, MERGE — fill only empty slots and refresh the schedule, never overwrite text the user wrote. If the Calendar connector is unavailable, skip the schedule and say so in the note.\n\nThe daily note is at exactly ${deliverable}.\n\nEnd your reply with: SAVED ${deliverable}`;
     case "close-day":
-      return `${AUTONOMOUS_PREFIX}\n\nTask: run the /close-day skill — Rishi's end-of-day routine — for ${todayDate()} (timezone ${HUD_TZ}), updating the daily note at exactly ${deliverable}.\n\nIMPORTANT: this skill normally interviews the user for a reflection (effort score, focus blocks, posts shipped). You are headless and CANNOT ask. Do NOT invent numbers. Instead: derive what you can from evidence in the vault (today's note, files written today, metrics.csv rows, run logs), append the "## EOD Reflection" section with what the evidence supports, and leave any frontmatter field you cannot evidence exactly as it already is. Mark unknown fields in the reflection body as "not logged".\n\nMerge into the existing note — never duplicate the section or clobber user-set text.\n\nEnd your reply with: SAVED ${deliverable}`;
+      return `${AUTONOMOUS_PREFIX}\n\nTask: run the /close-day skill — Rishi's end-of-day routine — for ${todayDate()} (timezone ${CONSOLE_TZ}), updating the daily note at exactly ${deliverable}.\n\nIMPORTANT: this skill normally interviews the user for a reflection (effort score, focus blocks, posts shipped). You are headless and CANNOT ask. Do NOT invent numbers. Instead: derive what you can from evidence in the vault (today's note, files written today, metrics.csv rows, run logs), append the "## EOD Reflection" section with what the evidence supports, and leave any frontmatter field you cannot evidence exactly as it already is. Mark unknown fields in the reflection body as "not logged".\n\nMerge into the existing note — never duplicate the section or clobber user-set text.\n\nEnd your reply with: SAVED ${deliverable}`;
     case "morning-intel":
-      return `${AUTONOMOUS_PREFIX}\n\nTask: run the /morning-intel skill — the full AI-sphere intelligence sweep — and save the brief at exactly ${deliverable}.\n\nThe skill sweeps the last 24h (AI news, X/Twitter announcements, trending YouTube in the Claude Code/Codex sphere, GitHub trending, Gmail triage) and synthesizes one vault brief ending in a "So What" content plan. Any source that is unavailable (missing connector, failed fetch) should be noted as unavailable and skipped — do not stall and do not fabricate its contents.\n\nInclude a "## Headlines" section of 3-5 bullets, each ending in a markdown link to its primary source — the HUD's AI Wire panel reads that section. YAML frontmatter: \`date\`, \`skill: morning-intel\`, \`tags: [intel, briefing]\`.\n\nEnd your reply with: SAVED ${deliverable}`;
+      return `${AUTONOMOUS_PREFIX}\n\nTask: run the /morning-intel skill — the full AI-sphere intelligence sweep — and save the brief at exactly ${deliverable}.\n\nThe skill sweeps the last 24h (AI news, X/Twitter announcements, trending YouTube in the Claude Code/Codex sphere, GitHub trending, Gmail triage) and synthesizes one vault brief ending in a "So What" content plan. Any source that is unavailable (missing connector, failed fetch) should be noted as unavailable and skipped — do not stall and do not fabricate its contents.\n\nInclude a "## Headlines" section of 3-5 bullets, each ending in a markdown link to its primary source — the console's AI Wire panel reads that section. YAML frontmatter: \`date\`, \`skill: morning-intel\`, \`tags: [intel, briefing]\`.\n\nEnd your reply with: SAVED ${deliverable}`;
     case "metrics-pull":
       return `${AUTONOMOUS_PREFIX}\n\nTask: run the /metrics-pull skill, then write a short run report at exactly ${deliverable}.\n\nThe skill is direct-exec: it runs its own scripts to pull current metric values and append rows to the vault metrics CSV (system/metrics/metrics.csv). Each source writes its own status (ok/stale/error/mock).\n\nAfter it runs, report per source: the metric, the value written, its status, and the error text for anything that did not come back ok. Report failures plainly — do not present a stale or mock row as a fresh pull. YAML frontmatter: \`date\`, \`skill: metrics-pull\`, \`tags: [metrics, ops]\`.\n\nEnd your reply with: SAVED ${deliverable}`;
     case "ads-dashboard":
@@ -372,7 +424,7 @@ function buildPrompt(intent, deliverable) {
     case "report-deck": {
       const scope = argScope(args), range = argRange(args);
       const id8 = (intent.id || "manual").slice(0, 8);
-      return `${AUTONOMOUS_PREFIX}\n\nTask: build the ${scope} performance deck for the last ${range} days and write the deliverable note at exactly ${deliverable}.\n\nSteps:\n1. Run: HUD_PUBLIC_URL=${HUD_PUBLIC_URL} /usr/bin/python3 ~/.claude/skills/report-deck/scripts/build_deck.py --scope ${scope} --range ${range} --id ${id8}\n2. Parse the JSON manifest it prints (keys: pptx, html, html_url, pptx_url, slides, narrative, kpis, summary). Exit code 2 means mixed currencies — write a note explaining that and stop.\n3. Write ${deliverable} with YAML frontmatter \`date\`, \`skill: report-deck\`, \`scope: ${scope}\`, \`range_days: ${range}\`, \`pptx: <manifest.pptx>\`, \`html: <manifest.html>\`, \`link: <manifest.html_url>\`, \`narrative: <manifest.narrative>\`, \`tags: [marketing, deck, ${scope}]\`; body = slide count, the summary bullets, and Download links to pptx_url and html_url.\n\nDo not run any other analysis. The spoken first line names the slide count plus one KPI and one decision from the summary.\n\nEnd your reply with: SAVED ${deliverable}`;
+      return `${AUTONOMOUS_PREFIX}\n\nTask: build the ${scope} performance deck for the last ${range} days and write the deliverable note at exactly ${deliverable}.\n\nSteps:\n1. Run: HUD_PUBLIC_URL=${CONSOLE_PUBLIC_URL} /usr/bin/python3 ~/.claude/skills/report-deck/scripts/build_deck.py --scope ${scope} --range ${range} --id ${id8}\n2. Parse the JSON manifest it prints (keys: pptx, html, html_url, pptx_url, slides, narrative, kpis, summary). Exit code 2 means mixed currencies — write a note explaining that and stop.\n3. Write ${deliverable} with YAML frontmatter \`date\`, \`skill: report-deck\`, \`scope: ${scope}\`, \`range_days: ${range}\`, \`pptx: <manifest.pptx>\`, \`html: <manifest.html>\`, \`link: <manifest.html_url>\`, \`narrative: <manifest.narrative>\`, \`tags: [marketing, deck, ${scope}]\`; body = slide count, the summary bullets, and Download links to pptx_url and html_url.\n\nDo not run any other analysis. The spoken first line names the slide count plus one KPI and one decision from the summary.\n\nEnd your reply with: SAVED ${deliverable}`;
     }
     // --- publishing (cwd = the agent project; deliverable by ABSOLUTE path) --
     case "ds-blog-publish": {
@@ -404,7 +456,13 @@ function buildPrompt(intent, deliverable) {
       const count = Number.isInteger(n) && n >= 1 && n <= 30 ? n : 6;
       const dry = args.dry_run === true;
       const shipDir = join(VAULT_ROOT, "inbox", "reports", "creatives");
-      return `${AUTONOMOUS_PREFIX}\n\nYou are running inside the Ads Generator Kit project (your cwd — its CLAUDE.md, brand files and the ad skills under .claude/skills apply). Produce a batch of ${count} static ad creatives ${topic ? `for: ${JSON.stringify(topic)}` : "for the most recent real offer in briefs/ads/ (newest yaml that is not an _example or _smoketest); name it in your spoken line"}.\n\nHEADLESS RULES (override the ad-campaign-architect interview):\n- Never ask. Infer product, audience and offer from the topic plus the brand/ files; state every inference in the note.\n- Pick ONE render skill by fit: sophisticated-ads (courses/upskilling, premium real-photo), coursib-style-ads (one offer, many wildly different looks), best-performing-ads (30-day AI Mastery locked layout), isaac-workshop-ads (live workshop, instructor-led). Vels MBA content: read VelsMBS/anti-vels.md FIRST — its rules beat everything, including this prompt.\n- Copy before pixels: ${count} variants, each committing to ONE distinct persuasion angle (no two share an angle), headline under 9 words, single CTA, no em-dashes, never a hex code inside an image prompt.\n- Write the campaign brief at briefs/ads/<slug>.yaml (schema in the tools/build_ads.py docstring), ratios 1:1 and 9:16.\n- ${dry ? "DRY RUN: \`python3 tools/build_ads.py briefs/ads/<slug>.yaml --dry-run\` — prompts only, no images, no API spend." : "Render: \`python3 tools/build_ads.py briefs/ads/<slug>.yaml\`. A variant that errors gets ONE retry via --only <id>; report anything still failing rather than re-rolling forever."}\n- Outputs land in deliverables/content/ads/<slug>/. ${dry ? "" : `Copy the 3 strongest PNGs (your judgment) to ${shipDir}/<date>-<slug>/ so the dashboard side has them.`}\n\nDeliverable at exactly ${abs} (absolute path — the vault, not this project): YAML frontmatter \`date\`, \`skill: bulk-creatives\`, \`topic\`, \`count: ${count}\`, \`render_skill\`, \`brief: briefs/ads/<slug>.yaml\`, \`status: rendered|dry-run|partial\`, \`tags: [creative, ads]\`; body = the angle table (variant id → angle → headline → CTA), the render log (rendered/failed per ratio), and every output file path.\n\nSpoken first line: ${dry ? `"I wrote ${count} ad concepts for <topic> — <two angle names> and more; nothing rendered, it was a dry run."` : `"<N> creatives are done for <topic> — angles like <two angle names>; the best three are on the board."`}\n\nEnd your reply with: SAVED ${abs}`;
+      let evidence = "";
+      try { evidence = creativeBriefContext(args, VAULT_ROOT); }
+      catch (error) {
+        log(`Rejected creative brief: ${error.message}`);
+        return null; // never silently fall back to an unrelated latest brief
+      }
+      return `${AUTONOMOUS_PREFIX}${evidence}\n\nYou are running inside the Ads Generator Kit project (your cwd — its CLAUDE.md, brand files and the ad skills under .claude/skills apply). Produce a batch of ${count} static ad creatives ${topic ? `for: ${JSON.stringify(topic)}` : "for the most recent real offer in briefs/ads/ (newest yaml that is not an _example or _smoketest); name it in your spoken line"}.\n\nHEADLESS RULES (override the ad-campaign-architect interview):\n- Never ask. Infer product, audience and offer from the topic plus the brand/ files; state every inference in the note.\n- Pick ONE render skill by fit: sophisticated-ads (courses/upskilling, premium real-photo), coursib-style-ads (one offer, many wildly different looks), best-performing-ads (30-day AI Mastery locked layout), isaac-workshop-ads (live workshop, instructor-led). Vels MBA content: read VelsMBS/anti-vels.md FIRST — its rules beat everything, including this prompt.\n- Copy before pixels: ${count} variants. ${evidence ? "Follow the saved experiment: change only its chosen variable, hold the verified offer and other variables constant, and label the control versus each test." : "Each commits to ONE distinct persuasion angle (no two share an angle)."} Headline under 9 words, single CTA, no em-dashes, never a hex code inside an image prompt.\n- Write the campaign brief at briefs/ads/<slug>.yaml (schema in the tools/build_ads.py docstring), ratios 1:1 and 9:16.\n- ${dry ? "DRY RUN: \`python3 tools/build_ads.py briefs/ads/<slug>.yaml --dry-run\` — prompts only, no images, no API spend." : "Render: \`python3 tools/build_ads.py briefs/ads/<slug>.yaml\`. A variant that errors gets ONE retry via --only <id>; report anything still failing rather than re-rolling forever."}\n- Outputs land in deliverables/content/ads/<slug>/. ${dry ? "" : `Copy the 3 strongest PNGs (your judgment) to ${shipDir}/<date>-<slug>/ so the dashboard side has them.`}\n\nDeliverable at exactly ${abs} (absolute path — the vault, not this project): YAML frontmatter \`date\`, \`skill: bulk-creatives\`, \`topic\`, \`count: ${count}\`, \`render_skill\`, \`brief: briefs/ads/<slug>.yaml\`, \`status: rendered|dry-run|partial\`, \`tags: [creative, ads]\`; body = the angle table (variant id → angle → headline → CTA), the render log (rendered/failed per ratio), and every output file path.\n\nSpoken first line: ${dry ? `"I wrote ${count} ad concepts for <topic> — <two angle names> and more; nothing rendered, it was a dry run."` : `"<N> creatives are done for <topic> — angles like <two angle names>; the best three are on the board."`}\n\nEnd your reply with: SAVED ${abs}`;
     }
     // --- EXAMPLE: adding your own skill -----------------------------------
     // case "my-skill":
@@ -438,9 +496,19 @@ const DEDUPE_SKILLS = new Set([
   "competitor-intel",
   "bulk-creatives",
 ]);
+// Skills with real external side effects (they publish / spend API credits).
+// An abandoned claim on one of these is NEVER auto-rerun — the side effect
+// may already have happened before the crash.
+const SIDE_EFFECT_SKILLS = new Set([
+  "ds-blog-publish",
+  "news-carousel",
+  "competitor-intel",
+  "bulk-creatives",
+]);
 // (hard timeouts live in TIMEOUT_MIN above; default 10 min)
 
 let active = 0;
+const activeChildren = new Set(); // live claude -p child processes
 const inFlight = new Set(); // intent.skill values currently running
 const pending = []; // queue filenames awaiting a slot
 const processing = new Set(); // queue filenames currently being processed
@@ -449,20 +517,112 @@ function enqueueNew() {
   if (!existsSync(QUEUE_DIR)) return;
   const files = readdirSync(QUEUE_DIR).filter((f) => f.endsWith(".json"));
   for (const f of files) {
-    // processing guard — the queue file stays on disk until processOne
-    // unlinks it at the end of the run; without this every poll re-adds
-    // in-flight intents and the scheduler spawns DUPLICATE claude sessions
+    // processing guard — claimed files are renamed into processing/, but this
+    // keeps a name from being queued twice within one poll cycle
     if (!pending.includes(f) && !processing.has(f)) pending.push(f);
   }
 }
 
-function peekSkill(fileName) {
+function peekSkill(fileName, dir = QUEUE_DIR) {
   try {
-    const intent = readJson(join(QUEUE_DIR, fileName));
+    const intent = readJson(join(dir, fileName));
     return intent.skill || null;
   } catch {
     return null;
   }
+}
+
+// THE claim: atomically rename the intent out of the queue dir. rename(2) is
+// atomic on the same filesystem, so exactly one runner wins; a failed rename
+// means another worker (or instance) owns the file — never execute it.
+function claimIntent(fileName) {
+  try {
+    renameSync(join(QUEUE_DIR, fileName), join(PROCESSING_DIR, fileName));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Move a claimed intent to failed/ with a human-readable note. Never rerun.
+function quarantine(fileName, reason) {
+  const dest = join(FAILED_DIR, fileName);
+  try {
+    renameSync(join(PROCESSING_DIR, fileName), dest);
+  } catch {
+    /* already gone */
+  }
+  try {
+    writeFileSync(`${dest}.note.txt`, `[${new Date().toISOString()}] ${reason}\n`, "utf8");
+  } catch {
+    /* ignore */
+  }
+  log(`quarantined ${fileName} -> failed/: ${reason}`);
+}
+
+// Boot reconcile — files left in processing/ mean a previous runner died
+// mid-run. Skills WITHOUT external side effects are safe to re-queue; anything
+// that publishes or spends credits goes to failed/ for a human to decide.
+function reconcileProcessing() {
+  let files = [];
+  try {
+    files = readdirSync(PROCESSING_DIR).filter((f) => f.endsWith(".json"));
+  } catch {
+    return;
+  }
+  for (const f of files) {
+    let skill = null;
+    try {
+      skill = readJson(join(PROCESSING_DIR, f)).skill || null;
+    } catch {
+      /* unreadable — quarantine below */
+    }
+    if (skill && !SIDE_EFFECT_SKILLS.has(skill)) {
+      try {
+        renameSync(join(PROCESSING_DIR, f), join(QUEUE_DIR, f));
+        log(`recovered abandoned intent ${f} (skill=${skill}) — re-queued`);
+        continue;
+      } catch {
+        /* fall through to quarantine */
+      }
+    }
+    quarantine(
+      f,
+      `abandoned in processing/ at startup (previous runner died mid-run); skill=${skill || "(unreadable)"}` +
+        (skill && SIDE_EFFECT_SKILLS.has(skill)
+          ? " has external side effects — NOT re-run automatically; the side effect may already have happened. Re-enqueue by hand only after checking the publish ledger / platform."
+          : " — could not be re-queued.")
+    );
+  }
+}
+
+// Intent shape validation — the queue FILENAME is the canonical id. A forged
+// intent.id ("../../evil") must never steer where run files are written.
+const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const SAFE_SKILL_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+function validateIntent(intent, canonicalId) {
+  if (!intent || typeof intent !== "object" || Array.isArray(intent)) {
+    return "intent is not an object";
+  }
+  if (intent.id !== undefined && intent.id !== canonicalId) {
+    return `embedded id ${JSON.stringify(intent.id)} does not match queue filename ${canonicalId}`;
+  }
+  if (typeof intent.skill !== "string" || !SAFE_SKILL_RE.test(intent.skill)) {
+    return `invalid skill: ${JSON.stringify(intent.skill)}`;
+  }
+  if (intent.args !== undefined && (typeof intent.args !== "object" || intent.args === null || Array.isArray(intent.args))) {
+    return "args is not an object";
+  }
+  if (intent.approved !== undefined && typeof intent.approved !== "boolean") {
+    return `invalid approved: ${JSON.stringify(intent.approved)}`;
+  }
+  if (intent.args?.creative_brief_id !== undefined && intent.skill !== "bulk-creatives") {
+    return "creative_brief_id is only supported by bulk-creatives";
+  }
+  if (intent.ts !== undefined && (typeof intent.ts !== "string" || Number.isNaN(Date.parse(intent.ts)))) {
+    return `invalid ts: ${JSON.stringify(intent.ts)}`;
+  }
+  return null;
 }
 
 function pickNext() {
@@ -477,9 +637,18 @@ function pickNext() {
   return -1;
 }
 
+// fileName has already been CLAIMED — it lives in PROCESSING_DIR now.
 async function processOne(fileName) {
-  const queuePath = join(QUEUE_DIR, fileName);
+  const queuePath = join(PROCESSING_DIR, fileName);
   if (!existsSync(queuePath)) return;
+
+  // The queue filename is the canonical run id — intent.id is never trusted
+  // for path construction (a forged id could write outside RUNS_DIR).
+  const runId = basename(fileName, ".json");
+  if (!SAFE_ID_RE.test(runId)) {
+    quarantine(fileName, `unsafe queue filename ${JSON.stringify(fileName)}`);
+    return;
+  }
 
   let intent;
   let lastErr = null;
@@ -496,7 +665,6 @@ async function processOne(fileName) {
     }
   }
   if (lastErr || !intent) {
-    const runId = basename(fileName, ".json");
     const ts = new Date().toISOString();
     writeJson(join(RUNS_DIR, `${runId}.json`), {
       id: runId,
@@ -512,16 +680,31 @@ async function processOne(fileName) {
       log_path: `system/runs/${runId}.md`,
       deliverable_path: null,
     });
-    log(`${runId}: bad json — wrote error run record: ${lastErr?.message}`);
-    try {
-      unlinkSync(queuePath);
-    } catch {
-      /* ignore */
-    }
+    quarantine(fileName, `bad intent json after 5 retries: ${lastErr?.message || "empty"}`);
     return;
   }
 
-  const runId = intent.id || basename(fileName, ".json");
+  const invalid = validateIntent(intent, runId);
+  if (invalid) {
+    const ts = new Date().toISOString();
+    writeJson(join(RUNS_DIR, `${runId}.json`), {
+      id: runId,
+      skill: typeof intent.skill === "string" ? intent.skill.slice(0, 64) : "(invalid)",
+      args: {},
+      ts_queued: ts,
+      ts_started: ts,
+      ts_completed: ts,
+      status: "error",
+      exit_code: -3,
+      summary: `invalid intent: ${invalid}`.slice(0, 200),
+      md_path: `system/runs/${runId}.md`,
+      log_path: `system/runs/${runId}.md`,
+      deliverable_path: null,
+    });
+    quarantine(fileName, `invalid intent: ${invalid}`);
+    return;
+  }
+
   const runJsonPath = join(RUNS_DIR, `${runId}.json`);
   const runMdPath = join(RUNS_DIR, `${runId}.md`);
   const deliverable = deliverablePathFor({ ...intent, id: runId });
@@ -540,6 +723,7 @@ async function processOne(fileName) {
     md_path: `system/runs/${runId}.md`,
     log_path: `system/runs/${runId}.md`,
     deliverable_path: deliverable,
+    deliverable_verified: null,
   };
   writeJson(runJsonPath, status);
 
@@ -550,12 +734,24 @@ async function processOne(fileName) {
     status.summary = `unknown or invalid intent: ${intent.skill}`;
     status.ts_completed = new Date().toISOString();
     writeJson(runJsonPath, status);
-    try {
-      unlinkSync(queuePath);
-    } catch {
-      /* ignore */
-    }
-    log(`${runId}: rejected — ${status.summary}`);
+    quarantine(fileName, status.summary);
+    return;
+  }
+
+  if (
+    PUBLISH_APPROVAL &&
+    DAILY_CAP[intent.skill] &&
+    !intent.args?.dry_run &&
+    intent.approved !== true
+  ) {
+    renameSync(queuePath, join(PENDING_DIR, fileName));
+    status.status = "pending-approval";
+    status.exit_code = null;
+    status.summary =
+      "live publish awaiting approval — approve from the Control Room or move the intent back to system/queue/";
+    status.ts_completed = null;
+    writeJson(runJsonPath, status);
+    log(`${runId}: ${status.summary}`);
     return;
   }
 
@@ -578,6 +774,10 @@ async function processOne(fileName) {
   }
   if (DAILY_CAP[intent.skill] && !intent.args?.dry_run) {
     const n = publishedToday(LEDGER_KIND[intent.skill]);
+    if (n === null) {
+      // fail CLOSED — an unreadable ledger must never disable the cap
+      return reject(-6, `publish ledger unreadable (${LEDGER_FILE}) — refusing to publish until it is fixed; see runner.log`);
+    }
     if (n >= DAILY_CAP[intent.skill]) {
       return reject(-5, `daily publish cap reached (${n}/${DAILY_CAP[intent.skill]} ${LEDGER_KIND[intent.skill]}s today) — say "as a draft" for a dry run`);
     }
@@ -613,7 +813,32 @@ args: ${argsJson}
     "utf8"
   );
 
-  const out = [];
+  // Bounded in-memory capture — keep the head and tail of the output with a
+  // truncation marker in between; a chatty child can no longer balloon RSS.
+  const OUT_HEAD_MAX = 256 * 1024;
+  const OUT_TAIL_MAX = 256 * 1024;
+  const out = { head: [], headLen: 0, tail: [], tailLen: 0, dropped: 0 };
+  const outPush = (s) => {
+    if (out.headLen < OUT_HEAD_MAX) {
+      out.head.push(s);
+      out.headLen += s.length;
+      return;
+    }
+    out.tail.push(s);
+    out.tailLen += s.length;
+    while (out.tailLen > OUT_TAIL_MAX && out.tail.length > 1) {
+      out.dropped += out.tail[0].length;
+      out.tailLen -= out.tail[0].length;
+      out.tail.shift();
+    }
+  };
+  const outJoin = () =>
+    out.tail.length === 0
+      ? out.head.join("")
+      : out.head.join("") +
+        `\n[runner: output truncated — ~${out.dropped} chars dropped]\n` +
+        out.tail.join("");
+
   await new Promise((resolve) => {
     // --dangerously-skip-permissions: headless `claude -p` runs non-interactive,
     // so the default permission mode DENIES file writes (the deliverable never
@@ -630,83 +855,127 @@ args: ${argsJson}
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
         cwd,
-        env: { ...process.env, HUD_VAULT_ROOT: VAULT_ROOT, HUD_RUN_ID: runId, HUD_TZ },
+        // Both spellings: the skills under ~/.claude/skills/ and the agent
+        // projects still read the pre-rename HUD_* names (build_deck.py reads
+        // HUD_PUBLIC_URL, metrics-pull reads HUD_TZ, publish_instagram.mjs
+        // reads HUD_VAULT_ROOT), so those stay until those repos are updated.
+        env: {
+          ...process.env,
+          ...(intent.skill === "bulk-creatives" ? creativeGeminiEnvironment(join(RUNNER_DIR, "..")) : {}),
+          CONSOLE_VAULT_ROOT: VAULT_ROOT,
+          CONSOLE_RUN_ID: runId,
+          CONSOLE_TZ,
+          CONSOLE_PUBLIC_URL,
+          HUD_VAULT_ROOT: VAULT_ROOT,
+          HUD_RUN_ID: runId,
+          HUD_TZ: CONSOLE_TZ,
+          HUD_PUBLIC_URL: CONSOLE_PUBLIC_URL,
+        },
       }
     );
+    activeChildren.add(proc);
 
     proc.stdout.on("data", (chunk) => {
-      out.push(chunk.toString());
-      try {
-        appendFileSync(runMdPath, chunk);
-      } catch {
-        /* ignore */
-      }
+      outPush(chunk.toString());
+      appendFile(runMdPath, chunk, () => {});
     });
     proc.stderr.on("data", (chunk) => {
-      out.push(chunk.toString());
-      try {
-        appendFileSync(runMdPath, chunk);
-      } catch {
-        /* ignore */
-      }
+      outPush(chunk.toString());
+      appendFile(runMdPath, chunk, () => {});
     });
 
     const HARD_TIMEOUT_MIN = TIMEOUT_MIN[intent.skill] ?? 10;
+    let timedOut = false;
+    let killTimer = null;
     const timer = setTimeout(() => {
+      timedOut = true;
+      outPush(`\n[runner: hard timeout ${HARD_TIMEOUT_MIN}m — soft kill sent]\n`);
       try {
-        proc.kill();
+        proc.kill(); // SIGTERM — give the child a chance to clean up
       } catch {
         /* ignore */
       }
-      out.push(`\n[runner: hard timeout ${HARD_TIMEOUT_MIN}m — killed]\n`);
+      // Escalate: a child that ignores the soft signal gets SIGKILLed after a
+      // short grace period, so the worker slot can never be held forever.
+      killTimer = setTimeout(() => {
+        outPush(`\n[runner: SIGKILL after 10s grace]\n`);
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }, 10_000);
     }, 1000 * 60 * HARD_TIMEOUT_MIN);
 
-    proc.on("close", (code) => {
+    // SINGLE-USE finalizer — `error` and `close` can both fire for the same
+    // child; every outcome funnels through here exactly once, and the worker
+    // slot is released (resolve) in a finally even if a write throws.
+    let settled = false;
+    const finalize = (outcome) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      const tsCompleted = new Date().toISOString();
-      const joined = out.join("").trim();
-      const lines = joined.split(/\r?\n/);
-      const firstLine =
-        lines.find(
-          (l) =>
-            l.trim().length > 0 &&
-            !l.startsWith("Warning:") &&
-            !l.startsWith("warning:")
-        ) ||
-        lines.find((l) => l.trim().length > 0) ||
-        "(no output)";
-      status.status = code === 0 ? "ok" : "error";
-      status.exit_code = code ?? -1;
-      status.ts_completed = tsCompleted;
-      status.summary = firstLine.slice(0, 200);
-      writeJson(runJsonPath, status);
+      if (killTimer) clearTimeout(killTimer);
+      activeChildren.delete(proc);
       try {
-        appendFileSync(
-          runMdPath,
-          `\n\`\`\`\n\n---\n*exit code=${code} · status=${status.status} · completed ${tsCompleted}*\n`
-        );
-      } catch {
-        /* ignore */
+        const tsCompleted = new Date().toISOString();
+        status.ts_completed = tsCompleted;
+        status.deliverable_verified = null;
+        if (outcome.kind === "spawn-error") {
+          status.status = "error";
+          status.exit_code = -2;
+          status.summary = `spawn error: ${outcome.err.message}`.slice(0, 200);
+          try {
+            appendFileSync(runMdPath, `\n\`\`\`\n\n[runner spawn error] ${outcome.err.message}\n`);
+          } catch {
+            /* ignore */
+          }
+          log(`${runId}: spawn error ${outcome.err.message}`);
+        } else {
+          const code = outcome.code;
+          const joined = outJoin().trim();
+          const lines = joined.split(/\r?\n/);
+          const firstLine =
+            lines.find(
+              (l) =>
+                l.trim().length > 0 &&
+                !l.startsWith("Warning:") &&
+                !l.startsWith("warning:")
+            ) ||
+            lines.find((l) => l.trim().length > 0) ||
+            "(no output)";
+          status.status = timedOut ? "timeout" : code === 0 ? "ok" : "error";
+          status.exit_code = code ?? -1;
+          status.summary = timedOut
+            ? `hard timeout after ${HARD_TIMEOUT_MIN}m — killed`.slice(0, 200)
+            : firstLine.slice(0, 200);
+          if (status.status === "ok" && deliverable !== null) {
+            status.deliverable_verified = existsSync(join(VAULT_ROOT, deliverable));
+            if (!status.deliverable_verified) {
+              status.status = "ok-unverified";
+              log(`${runId}: exit 0 but deliverable missing: ${deliverable}`);
+            }
+          }
+          try {
+            appendFileSync(
+              runMdPath,
+              `\n\`\`\`\n\n---\n*exit code=${code} · status=${status.status} · completed ${tsCompleted}*\n`
+            );
+          } catch {
+            /* ignore */
+          }
+          log(`${runId}: completed exit=${code} status=${status.status}`);
+        }
+        writeJson(runJsonPath, status);
+      } catch (e) {
+        log(`${runId}: finalize failed: ${e.message}`);
+      } finally {
+        resolve();
       }
-      log(`${runId}: completed exit=${code} status=${status.status}`);
-      resolve();
-    });
+    };
 
-    proc.on("error", (err) => {
-      clearTimeout(timer);
-      status.status = "error";
-      status.exit_code = -2;
-      status.ts_completed = new Date().toISOString();
-      status.summary = `spawn error: ${err.message}`.slice(0, 200);
-      writeJson(runJsonPath, status);
-      try {
-        appendFileSync(runMdPath, `\n\`\`\`\n\n[runner spawn error] ${err.message}\n`);
-      } catch {
-        /* ignore */
-      }
-      log(`${runId}: spawn error ${err.message}`);
-      resolve();
-    });
+    proc.on("close", (code) => finalize({ kind: "close", code }));
+    proc.on("error", (err) => finalize({ kind: "spawn-error", err }));
   });
 
   try {
@@ -716,31 +985,44 @@ args: ${argsJson}
   }
 }
 
+const POLL_MS = 1500;
 async function loop() {
+  let delay = POLL_MS;
   while (true) {
-    enqueueNew();
-    // Greedy fill — grab runnable intents until the concurrency cap.
-    let progress = true;
-    while (progress && active < MAX_CONCURRENT && pending.length > 0) {
-      const idx = pickNext();
-      if (idx < 0) {
-        progress = false;
-        break;
+    // One transient fs error must never kill scheduling forever — each
+    // iteration is guarded, with bounded backoff on repeated failures.
+    try {
+      enqueueNew();
+      // Greedy fill — grab runnable intents until the concurrency cap.
+      let progress = true;
+      while (progress && active < MAX_CONCURRENT && pending.length > 0) {
+        const idx = pickNext();
+        if (idx < 0) {
+          progress = false;
+          break;
+        }
+        const next = pending.splice(idx, 1)[0];
+        const skill = peekSkill(next);
+        // Atomic claim — rename into processing/. If it fails, another
+        // runner instance owns this file (or it vanished): skip it.
+        if (!claimIntent(next)) continue;
+        active++;
+        if (skill) inFlight.add(skill);
+        processing.add(next);
+        processOne(next)
+          .catch((e) => log(`processOne crashed: ${e.message}`))
+          .finally(() => {
+            active--;
+            if (skill) inFlight.delete(skill);
+            processing.delete(next);
+          });
       }
-      const next = pending.splice(idx, 1)[0];
-      const skill = peekSkill(next);
-      active++;
-      if (skill) inFlight.add(skill);
-      processing.add(next);
-      processOne(next)
-        .catch((e) => log(`processOne crashed: ${e.message}`))
-        .finally(() => {
-          active--;
-          if (skill) inFlight.delete(skill);
-          processing.delete(next);
-        });
+      delay = POLL_MS;
+    } catch (e) {
+      delay = Math.min(delay * 2, 60_000);
+      log(`scheduler iteration failed: ${e.message} — backing off ${delay}ms`);
     }
-    await new Promise((r) => setTimeout(r, 1500));
+    await new Promise((r) => setTimeout(r, delay));
   }
 }
 
@@ -769,34 +1051,109 @@ function pidAlive(pid) {
     process.kill(pid, 0); // signal 0 = liveness check, throws if dead
     return true;
   } catch {
+    // Doesn't exist (ESRCH) or can't be signalled — either way it's not a
+    // runner we could conflict with: treat as stale.
     return false;
   }
 }
 
-if (existsSync(PIDFILE)) {
+function readPidfile() {
   try {
-    const otherPid = parseInt(readFileSync(PIDFILE, "utf8").trim(), 10);
-    if (Number.isInteger(otherPid) && otherPid !== process.pid && pidAlive(otherPid)) {
-      log(`another runner alive at pid ${otherPid} — exiting this one (pid ${process.pid})`);
-      process.exit(0);
-    }
+    const raw = readFileSync(PIDFILE, "utf8").trim();
+    // JSON {pid, started} since hardening; a bare integer is a legacy file.
+    const parsed = raw.startsWith("{") ? JSON.parse(raw) : { pid: parseInt(raw, 10) };
+    return Number.isInteger(parsed.pid) ? parsed : null;
   } catch {
-    /* stale pidfile — overwrite */
+    return null;
   }
 }
-writeFileSync(PIDFILE, String(process.pid), "utf8");
+
+// Exclusive create ('wx') closes the check-then-write race: exactly one of
+// two concurrent starts wins the create; the loser inspects the winner.
+function acquirePidLock() {
+  const payload =
+    JSON.stringify({ pid: process.pid, started: new Date().toISOString() }) + "\n";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      writeFileSync(PIDFILE, payload, { encoding: "utf8", flag: "wx" });
+      return true;
+    } catch (e) {
+      if (e?.code !== "EEXIST") {
+        log(`pidfile write failed: ${e.message}`);
+        return false;
+      }
+      const other = readPidfile();
+      if (other && other.pid !== process.pid && pidAlive(other.pid)) {
+        log(`another runner alive at pid ${other.pid} — exiting this one (pid ${process.pid})`);
+        process.exit(0);
+      }
+      // Stale (dead/recycled pid or unreadable) — remove and retry 'wx'.
+      try {
+        unlinkSync(PIDFILE);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return false;
+}
+
+if (!acquirePidLock()) {
+  log("could not acquire pid lock — exiting");
+  process.exit(1);
+}
 process.on("exit", () => {
   try {
-    const cur = parseInt(readFileSync(PIDFILE, "utf8").trim(), 10);
-    if (cur === process.pid) unlinkSync(PIDFILE);
+    const cur = readPidfile();
+    if (cur && cur.pid === process.pid) unlinkSync(PIDFILE);
   } catch {
     /* ignore */
   }
 });
 
+// Graceful shutdown — terminate active claude children before exiting so a
+// stopped runner never leaves orphaned publish jobs running.
+let shuttingDown = false;
+function shutdown(sig) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(`received ${sig} — terminating ${activeChildren.size} active child(ren), exiting`);
+  for (const p of activeChildren) {
+    try {
+      p.kill();
+    } catch {
+      /* ignore */
+    }
+  }
+  const code = sig === "SIGINT" ? 130 : 143;
+  if (activeChildren.size === 0) process.exit(code);
+  setTimeout(() => {
+    for (const p of activeChildren) {
+      try {
+        p.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+    }
+    process.exit(code);
+  }, 2000);
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
 ensureDirs();
+reconcileProcessing();
+const pendingApprovalCount = readdirSync(PENDING_DIR).filter((f) => f.endsWith(".json")).length;
+if (pendingApprovalCount > 0) {
+  log(`${pendingApprovalCount} live publish(es) awaiting approval in system/queue/pending-approval/`);
+}
 log(`runner booted (pid ${process.pid}) vault=${VAULT_ROOT} model=${CLAUDE_MODEL}`);
 writeHeartbeat();
 setInterval(writeHeartbeat, 15_000);
 watchLoop();
-loop();
+// A dead scheduler must not keep heartbeating as if alive — exit non-zero so
+// a service manager (launchd/systemd/Task Scheduler) can restart the runner.
+loop().catch((e) => {
+  log(`FATAL: scheduler loop died: ${e.stack || e.message}`);
+  process.exit(1);
+});

@@ -9,8 +9,10 @@ import { diffEngagement, type CelebrationEvent } from "@/lib/celebrate";
 import { scrubRunSummary, humanizeFailure } from "@/lib/spokenText";
 import AiNews from "@/components/panels/AiNews";
 import { DEMO_MARKETING } from "@/lib/demo";
-import { BG_MODES, type BgMode, type CelebrateSignal, type CoreMode } from "./coreTypes";
+import { deriveReadout, deriveStrands } from "@/lib/strands";
+import type { CelebrateSignal, CoreMode } from "./coreTypes";
 import ReportOverlay from "./ReportOverlay";
+import Signals from "./panels/Signals";
 import PaidMedia from "./panels/PaidMedia";
 import SearchAeo from "./panels/SearchAeo";
 import Sources from "./panels/Sources";
@@ -18,9 +20,12 @@ import Shipped from "./panels/Shipped";
 import Pacing from "./panels/Pacing";
 import DecisionQueue from "./panels/DecisionQueue";
 import CommandDeck from "./panels/CommandDeck";
-import { SectionTitle } from "./panels/shared";
+import { syncAlertCallouts } from "@/lib/alertCallouts";
+import { NumberRoll, SectionTitle, pressable } from "./panels/shared";
 
-const Core = dynamic(() => import("./WireCore"), { ssr: false });
+const Core = dynamic(() => import("./ui/CityCore"), { ssr: false });
+const PaidDetailOverlay = dynamic(() => import("./PaidDetailOverlay"), { ssr: false });
+const CreativeIntelligenceOverlay = dynamic(() => import("./CreativeIntelligenceOverlay"), { ssr: false });
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -29,10 +34,16 @@ const Core = dynamic(() => import("./WireCore"), { ssr: false });
 function useVaultState(intervalMs = 5000) {
   const [state, setState] = useState<VaultState | null>(null);
   const [error, setError] = useState(false);
+  const inflightRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
 
   const pull = useCallback(async () => {
+    if (inflightRef.current) return; // never stack a poll on a slow response
+    inflightRef.current = true;
+    const ctl = new AbortController();
+    abortRef.current = ctl;
     try {
-      const res = await fetch("/api/state", { cache: "no-store" });
+      const res = await fetch("/api/state", { cache: "no-store", signal: ctl.signal });
       if (!res.ok) throw new Error(String(res.status));
       const j = (await res.json()) as VaultState;
       // ?demo=marketing — render every marketing panel populated without
@@ -40,27 +51,40 @@ function useVaultState(intervalMs = 5000) {
       setState(window.location.search.includes("demo=marketing") ? { ...j, ...DEMO_MARKETING } : j);
       setError(false);
     } catch {
-      setError(true);
+      if (!ctl.signal.aborted) setError(true);
+    } finally {
+      inflightRef.current = false;
     }
   }, []);
 
   useEffect(() => {
-    pull();
-    const id = setInterval(pull, intervalMs);
-    return () => clearInterval(id);
+    void pull();
+    const id = setInterval(() => void pull(), intervalMs);
+    return () => {
+      clearInterval(id);
+      abortRef.current?.abort();
+    };
   }, [pull, intervalMs]);
 
   return { state, error, refresh: pull };
 }
 
-function useClock() {
+function useClock(tickMs = 1000) {
   const [now, setNow] = useState<Date | null>(null);
   useEffect(() => {
     setNow(new Date());
-    const id = setInterval(() => setNow(new Date()), 1000);
+    const id = setInterval(() => setNow(new Date()), tickMs);
     return () => clearInterval(id);
-  }, []);
+  }, [tickMs]);
   return now;
+}
+
+/** true when a key event started on something that handles keys itself */
+function onInteractive(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    !!target.closest("button, a, input, textarea, select, [role='button'], [role='checkbox'], [contenteditable='true']")
+  );
 }
 
 function fmtClock(s: number): string {
@@ -125,7 +149,7 @@ function batchAnnouncement(runs: RunEntry[]): string {
 const AudioIO = memo(function AudioIO({ mode }: { mode: CoreMode }) {
   const live = mode === "speaking" || mode === "listening";
   return (
-    <section className="block boot-stagger" style={{ animationDelay: "0.42s" }}>
+    <section className="block accent-violet boot-stagger" style={{ animationDelay: "0.42s" }}>
       <SectionTitle title="Audio I/O" tick={live ? "TTS.LIVE" : "TTS.STANDBY"} />
       <div className={`wave ${live ? "live" : "idle"} ${mode === "listening" ? "cobalt" : ""}`}>
         {Array.from({ length: 36 }, (_, i) => (
@@ -135,76 +159,6 @@ const AudioIO = memo(function AudioIO({ mode }: { mode: CoreMode }) {
       <div className="audio-meta">
         <span>hold SPACE to talk · ESC to stop</span>
       </div>
-    </section>
-  );
-});
-
-const Priorities = memo(function Priorities({
-  state,
-  hot,
-  flash,
-  onToggle,
-}: {
-  state: VaultState;
-  hot?: boolean;
-  flash?: boolean;
-  onToggle: (index: number, done: boolean) => void;
-}) {
-  const d = state.daily;
-  const q = state.engagement?.quests ?? null;
-  const ageDays = d && !d.isToday ? noteAgeDays(d.date) : 0;
-  const veryStale = ageDays > 2;
-  return (
-    <section
-      className={`block boot-stagger ${!d || d.isToday ? "" : "note-stale"} ${hot ? "voice-hot" : ""} ${flash ? "quest-flash" : ""}`}
-      style={{ animationDelay: "0.18s" }}
-    >
-      <SectionTitle
-        title="Directives"
-        tick={q && q.top3.done > 0 ? `${q.top3.done}/${q.top3.goal}` : "TOP.3"}
-      />
-      {d ? (
-        <>
-          {!d.isToday && (
-            <div className={`stale-banner ${veryStale ? "err" : ""}`}>
-              ⚠ note is {ageDays}d old — run /today
-            </div>
-          )}
-          {d.top3.map((p, i) =>
-            // blank template slots ("1. [ ] " with no text) stay out of the
-            // card; index i is the note's own ordering, so toggles still land
-            p.text ? (
-              <div
-                className={`prio ${p.done ? "done" : ""} ${d.isToday ? "clickable" : ""}`}
-                key={i}
-                role={d.isToday ? "button" : undefined}
-                title={d.isToday ? (p.done ? "mark open" : "mark done") : undefined}
-                onClick={d.isToday ? () => onToggle(i, !p.done) : undefined}
-              >
-                <span className="box">{p.done ? "■" : "□"}</span>
-                <span>{p.text}</span>
-              </div>
-            ) : null
-          )}
-          {d.top3.every((p) => !p.text) && (
-            <div className="prio dim">no priorities set — say “today” to start the day</div>
-          )}
-          <div className="prio-date">{d.isToday ? "today" : `carried · ${d.date}`}</div>
-          {/* the Daily Drivers quest board — lives in the note already; the
-              wall finally shows it. Display-only (tick them in the note). */}
-          {q && q.drivers.items.length > 0 && (
-            <div className="drivers-row">
-              {q.drivers.items.map((it) => (
-                <span key={it.label} className={`drv ${it.done ? "done" : ""}`}>
-                  <span className="box">{it.done ? "■" : "□"}</span> {it.label}
-                </span>
-              ))}
-            </div>
-          )}
-        </>
-      ) : (
-        <div className="prio dim">no daily note found</div>
-      )}
     </section>
   );
 });
@@ -220,12 +174,12 @@ const Wire = memo(function Wire({
   const m = state.morning;
   if (!m || m.heads.length === 0) return null;
   return (
-    <section className="block boot-stagger" style={{ animationDelay: "0.5s" }}>
+    <section className="block accent-coral boot-stagger" style={{ animationDelay: "0.5s" }}>
       <SectionTitle title="AI Wire" tick="MORNING.INTEL" />
       {/* two only — the right column is full; more would push the deck off-row */}
       {m.heads.slice(0, 2).map((h, i) => (
-        <div className="wire-row" key={i} role="button" onClick={() => onOpen(m.rel)}>
-          <span className="wire-bullet">▸</span>
+        <div className="wire-row" key={i} {...pressable(() => onOpen(m.rel))}>
+          <span className="wire-bullet" aria-hidden="true">▸</span>
           <span>{h}</span>
         </div>
       ))}
@@ -240,7 +194,7 @@ function parseHHMM(t: string): number {
 
 const Schedule = memo(function Schedule({ state, hot }: { state: VaultState; hot?: boolean }) {
   const d = state.daily;
-  const now = useClock();
+  const now = useClock(30_000); // minute precision is enough for the block list
   if (!d || d.schedule.length === 0) return null;
   const nowMin = now && d.isToday ? now.getHours() * 60 + now.getMinutes() : -1;
   const items = d.schedule.map((s) => ({ ...s, min: parseHHMM(s.time) }));
@@ -254,8 +208,8 @@ const Schedule = memo(function Schedule({ state, hot }: { state: VaultState; hot
   const ageDays = d.isToday ? 0 : noteAgeDays(d.date);
   return (
     <section
-      className={`block boot-stagger ${d.isToday ? "" : "note-stale"} ${hot ? "voice-hot" : ""}`}
-      style={{ animationDelay: "0.34s" }}
+      className={`block accent-sky boot-stagger ${d.isToday ? "" : "note-stale"} ${hot ? "voice-hot" : ""}`}
+      style={{ animationDelay: "0.3s" }}
     >
       <SectionTitle
         title="Schedule"
@@ -293,7 +247,7 @@ function TopBar({ state }: { state: VaultState | null }) {
   const now = useClock();
   const e = state?.engagement;
   return (
-    <header className="topbar hud-top boot-stagger" style={{ animationDelay: "0.05s" }}>
+    <header className="topbar console-top boot-stagger" style={{ animationDelay: "0.05s" }}>
       <div className="wordmark">
         <span className="name">ARGUS</span>
         <span className="expansion">Autonomous Reporting &amp; Growth Unified System</span>
@@ -303,11 +257,17 @@ function TopBar({ state }: { state: VaultState | null }) {
       </div>
       <div className="clock-wrap">
         <div className="clock" suppressHydrationWarning>
-          {now
-            ? `${String(now.getHours()).padStart(2, "0")}:${String(
+          {/* HH:MM rolls over like a station clock; seconds stay plain so the
+              bar never carries constant motion */}
+          {now ? (
+            <NumberRoll
+              text={`${String(now.getHours()).padStart(2, "0")}:${String(
                 now.getMinutes()
-              ).padStart(2, "0")}`
-            : "--:--"}
+              ).padStart(2, "0")}`}
+            />
+          ) : (
+            "--:--"
+          )}
           <span className="sec" suppressHydrationWarning>
             {now ? `:${String(now.getSeconds()).padStart(2, "0")}` : ""}
           </span>
@@ -333,7 +293,7 @@ function TopBar({ state }: { state: VaultState | null }) {
                 <i key={i} className={on ? "on" : i === 6 && e.streaks.ship.atRisk ? "risk" : ""} />
               ))}
             </span>
-            <span className="chain-n">🔥 {e.streaks.ship.current}</span>
+            <span className="chain-n">🔥 <NumberRoll text={String(e.streaks.ship.current)} /></span>
           </div>
         )}
       </div>
@@ -357,10 +317,12 @@ const MODE_KEYS: Record<string, CoreMode> = {
 const LAST_SEEN_KEY = "argus.lastSeen.v1";
 const DIGEST_AFTER_MS = 4 * 3_600_000; // away ≥4h earns a digest
 
-export default function HUD() {
-  const { state, error, refresh } = useVaultState(5000);
+export default function Console() {
+  const { state, error } = useVaultState(5000);
   const [modeOverride, setModeOverride] = useState<CoreMode | null>(null);
-  const [bgMode, setBgMode] = useState<BgMode>("grid");
+  // day-wise paid detail — off the wall by design, opened from the panel button
+  const [paidDetail, setPaidDetail] = useState(false);
+  const [creativeDetail, setCreativeDetail] = useState(false);
   const [voiceSpeaking, setVoiceSpeaking] = useState(false);
   const [ptt, setPtt] = useState(false);
   const [wakeListening, setWakeListening] = useState(false);
@@ -404,6 +366,9 @@ export default function HUD() {
   const [report, setReport] = useState<{ path: string; content: string } | null>(null);
   const reportOpenRef = useRef(false);
   reportOpenRef.current = report !== null;
+  // the Esc handler is bound once — it reads open-state through refs
+  const paidDetailRef = useRef(false);
+  paidDetailRef.current = paidDetail;
   const spokenRunsRef = useRef<Set<string>>(new Set());
   const seenAlertsRef = useRef<Set<string>>(new Set());
   const calloutsRef = useRef<typeof callouts>([]);
@@ -424,6 +389,19 @@ export default function HUD() {
     if (cls === "err") console.warn(`[argus] ${text}`);
     else console.debug(`[argus:${cls}] ${text}`);
   }, []);
+
+  // small visible toast (bottom-left, above the button rail) for failures
+  // that would otherwise vanish into the console
+  const [toast, setToast] = useState<string | null>(null);
+  useEffect(() => {
+    if (!toast) return;
+    const id = setTimeout(() => setToast(null), 5000);
+    return () => clearTimeout(id);
+  }, [toast]);
+
+  // screen-reader announcements for task callouts finishing (visually the
+  // card morphs/colors — this is the non-visual channel)
+  const [liveMsg, setLiveMsg] = useState("");
 
   const openReport = useCallback(
     async (path: string) => {
@@ -451,23 +429,6 @@ export default function HUD() {
       pushLine("err", "couldn't load transcript");
     }
   }, [pushLine]);
-
-  const toggleDirective = useCallback(
-    async (index: number, done: boolean) => {
-      try {
-        const res = await fetch("/api/daily", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ index, done }),
-        });
-        if (!res.ok) throw new Error(String(res.status));
-        await refresh();
-      } catch {
-        pushLine("err", "directive update failed");
-      }
-    },
-    [refresh, pushLine]
-  );
 
   // ?demo=callouts — seed the doc callouts on demand (filming + layout checks)
   useEffect(() => {
@@ -553,17 +514,18 @@ export default function HUD() {
     return () => clearTimeout(id);
   }, [voiceSpeaking, hotPanels]);
 
-  // P2 — push-to-talk: hold Space to record, release to send
+  // P2 — push-to-talk: hold Space to record, release to send. Space on a
+  // focused button/link/row keeps its normal meaning — no hijacking.
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
-      if (e.code !== "Space" || e.repeat) return;
+      if (e.code !== "Space" || e.repeat || onInteractive(e.target)) return;
       e.preventDefault();
       void voice.startCapture().then((ok) => {
         if (ok) setPtt(true);
       });
     };
     const up = (e: KeyboardEvent) => {
-      if (e.code !== "Space") return;
+      if (e.code !== "Space" || onInteractive(e.target)) return;
       e.preventDefault();
       setPtt(false);
       void voice.finishCapture();
@@ -583,7 +545,12 @@ export default function HUD() {
         setModeOverride(MODE_KEYS[e.key]);
         pushLine("sys", `core mode override → ${MODE_KEYS[e.key].toUpperCase()}`);
       } else if (e.key === "Escape") {
-        // overlay open → Esc closes it and does nothing else
+        // overlay open → Esc closes it and does nothing else. The paid detail
+        // sits above the report overlay, so it unwinds first.
+        if (paidDetailRef.current) {
+          setPaidDetail(false);
+          return;
+        }
         if (reportOpenRef.current) {
           setReport(null);
           return;
@@ -593,12 +560,6 @@ export default function HUD() {
       } else if (e.key === "0") {
         setModeOverride(null);
         pushLine("sys", "core mode → AUTO");
-      } else if (e.key === "b" || e.key === "B") {
-        setBgMode((cur) => {
-          const next = BG_MODES[(BG_MODES.indexOf(cur) + 1) % BG_MODES.length];
-          pushLine("sys", `background → ${next.toUpperCase()}`);
-          return next;
-        });
       } else if (e.key === "6" || e.key === "7") {
         // celebration demo/tuning — 6 major, 7 record
         const tier = e.key === "6" ? ("major" as const) : ("record" as const);
@@ -621,8 +582,10 @@ export default function HUD() {
   useEffect(() => {
     const flags = state?.marketing?.flags ?? [];
     const dash = state?.marketing?.latest_reports.dashboard ?? "ops/ads-dashboard.md";
+    if (!state?.marketing) return;
+    setCallouts(cards => syncAlertCallouts(cards, flags, dash));
     // alerts on screen right now (their targets carry a #code anchor)
-    let onScreen = calloutsRef.current.filter((c) => c.kind === "doc" && c.target.includes("#")).length;
+    let onScreen = syncAlertCallouts(calloutsRef.current, flags, dash).filter((c) => c.kind === "doc" && c.target.includes("#")).length;
     for (const f of flags) {
       if (f.level === "info" || seenAlertsRef.current.has(f.code)) continue;
       if (onScreen >= 2) break;
@@ -687,6 +650,26 @@ export default function HUD() {
       return next;
     });
   }, [state]);
+
+  // announce task status changes politely — working → done/failed, or the
+  // morph into a doc/link card ("ready")
+  const prevTaskPhasesRef = useRef<Map<number, string | undefined>>(new Map());
+  useEffect(() => {
+    const prev = prevTaskPhasesRef.current;
+    const next = new Map<number, string | undefined>();
+    const msgs: string[] = [];
+    for (const c of callouts) {
+      if (c.kind === "task") {
+        next.set(c.id, c.phase);
+        if (prev.get(c.id) === "working" && c.phase === "failed") msgs.push(`${c.label} failed`);
+        else if (prev.get(c.id) === "working" && c.phase === "done") msgs.push(`${c.label} complete`);
+      } else if (prev.get(c.id) === "working") {
+        msgs.push(`${c.label} ready`);
+      }
+    }
+    prevTaskPhasesRef.current = next;
+    if (msgs.length > 0) setLiveMsg(msgs.join(". "));
+  }, [callouts]);
 
   // ok-but-no-deliverable tasks flash COMPLETE, then clear themselves
   useEffect(() => {
@@ -847,31 +830,68 @@ export default function HUD() {
           ? "working"
           : "idle";
   const mode = modeOverride ?? autoMode;
+  // one wire per channel of the wall — the centerpiece renders live data,
+  // never an invented composite (see lib/strands.ts)
+  const strands = useMemo(
+    () => deriveStrands(state, mode === "working"),
+    [state, mode]
+  );
+  // the one figure the nucleus holds — money first, all verdicts Python's
+  const readout = useMemo(() => deriveReadout(state), [state]);
   const allowed = useMemo(() => new Set(state?.allowed_skills ?? []), [state?.allowed_skills]);
+  // connection health for the banner: first load vs lost-with-old-data vs down
+  const loading = state === null;
+  const conn: "ok" | "connecting" | "stale" | "down" = error
+    ? state
+      ? "stale"
+      : "down"
+    : state
+      ? "ok"
+      : "connecting";
 
   return (
     <main className="stage">
-      <Core mode={mode} bgMode={bgMode} getLevel={voice.getLevel} celebrate={celebrate} />
+      {conn !== "ok" && (
+        <div className={`conn-banner ${conn === "connecting" ? "" : "err"}`} role="status">
+          {conn === "connecting"
+            ? "connecting to ARGUS…"
+            : conn === "stale"
+              ? "connection lost — showing last data, retrying every 5s"
+              : "can't reach the ARGUS server — retrying every 5s"}
+        </div>
+      )}
+      <div className="vh" role="status" aria-live="polite">
+        {liveMsg}
+      </div>
+      {toast && (
+        <div className="console-toast" role="status">
+          {toast}
+        </div>
+      )}
 
-      <div className="hud">
+      <div className="console">
         <TopBar state={state} />
+        <Core mode={mode} strands={strands} readout={readout} getLevel={voice.getLevel} celebrate={celebrate} />
 
-        <div className="hud-left">
-          <PaidMedia m={state?.marketing ?? null} hot={hotPanels.includes("paid") || hotPanels.includes("vitals")} />
-          <SearchAeo m={state?.marketing ?? null} hot={hotPanels.includes("search")} />
-          {state && (
-            <Priorities
-              state={state}
-              hot={hotPanels.includes("priorities")}
-              flash={flashPanels.includes("priorities")}
-              onToggle={toggleDirective}
-            />
-          )}
-          {state && <Schedule state={state} hot={hotPanels.includes("schedule")} />}
+        <div className="console-left">
           <AiNews hot={hotPanels.includes("news")} />
+          <Signals
+            m={state?.marketing ?? null}
+            loading={loading}
+            hot={hotPanels.includes("signals") || hotPanels.includes("alerts")}
+            onOpen={openReport}
+          />
+          <PaidMedia
+            m={state?.marketing ?? null}
+            loading={loading}
+            hot={hotPanels.includes("paid") || hotPanels.includes("vitals")}
+            onDetail={() => setPaidDetail(true)}
+          />
+          <SearchAeo m={state?.marketing ?? null} loading={loading} hot={hotPanels.includes("search")} />
+          {state && <Schedule state={state} hot={hotPanels.includes("schedule")} />}
         </div>
 
-        <div className="hud-center">
+        <div className="console-center">
           {callouts.map((c) => {
             const isTask = c.kind === "task";
             const elapsed =
@@ -888,14 +908,12 @@ export default function HUD() {
                 <i className="br br-b" aria-hidden="true" />
                 <div
                   className={`callout-box${isTask ? ` task ${c.phase ?? ""}` : ""}`}
-                  {...(!isTask && {
-                    role: "button",
-                    tabIndex: 0,
-                    onClick: () =>
+                  {...(!isTask &&
+                    pressable(() =>
                       c.kind === "link"
                         ? window.open(c.target, "_blank", "noopener")
-                        : void openReport(c.target),
-                  })}
+                        : void openReport(c.target)
+                    ))}
                 >
                   <span className="callout-dot" />
                   <span className="callout-text">
@@ -950,15 +968,17 @@ export default function HUD() {
           )}
         </div>
 
-        <div className="hud-right">
+        <div className="console-right">
           <CommandDeck
             state={state}
             allowed={allowed}
             hot={hotPanels.includes("deck") || hotPanels.includes("pipeline") || hotPanels.includes("diagnostics")}
             onQueued={onQueued}
+            onCreativeIntelligence={() => setCreativeDetail(true)}
           />
-          <Sources m={state?.marketing ?? null} hot={hotPanels.includes("sources")} onOpen={openReport} />
+          <Sources m={state?.marketing ?? null} loading={loading} hot={hotPanels.includes("sources")} onOpen={openReport} />
           <Shipped
+            loading={loading}
             items={state?.shipped ?? []}
             quests={state?.engagement?.quests ?? null}
             record={
@@ -974,7 +994,7 @@ export default function HUD() {
           {state && <Wire state={state} onOpen={openReport} />}
         </div>
 
-        <div className="hud-bottom directive-bar">
+        <div className="console-bottom directive-bar">
           <Pacing m={state?.marketing ?? null} hot={hotPanels.includes("pacing") || hotPanels.includes("objective")} />
           <DecisionQueue m={state?.marketing ?? null} hot={hotPanels.includes("decisions")} onOpen={openReport} />
         </div>
@@ -1001,6 +1021,17 @@ export default function HUD() {
         </button>
       </div>
 
+      {paidDetail && (
+        <PaidDetailOverlay targets={state?.marketing?.targets} onClose={() => setPaidDetail(false)} />
+      )}
+
+      {creativeDetail && (
+        <CreativeIntelligenceOverlay
+          onClose={() => setCreativeDetail(false)}
+          demo={typeof window !== "undefined" && new URLSearchParams(window.location.search).get("demo") === "marketing"}
+        />
+      )}
+
       {report && (
         <ReportOverlay
           report={report}
@@ -1010,10 +1041,16 @@ export default function HUD() {
               ? {
                   label: "reset transcript ×",
                   onClick: () => {
-                    void fetch("/api/transcript", { method: "DELETE" }).then(() => {
-                      setReport(null);
-                      pushLine("sys", "voice transcript cleared");
-                    });
+                    void fetch("/api/transcript", { method: "DELETE" })
+                      .then((res) => {
+                        if (!res.ok) throw new Error(String(res.status));
+                        setReport(null);
+                        pushLine("sys", "voice transcript cleared");
+                      })
+                      .catch(() => {
+                        setToast("couldn't clear the transcript — try again");
+                        pushLine("err", "transcript reset failed");
+                      });
                   },
                 }
               : undefined

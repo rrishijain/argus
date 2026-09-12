@@ -15,6 +15,22 @@ export const dynamic = "force-dynamic";
 const MAX_BYTES = 8 * 1024 * 1024; // ~8MB ≈ well over a minute of opus
 
 export async function POST(req: Request) {
+  // reject oversized uploads by header BEFORE buffering the body
+  const declared = Number(req.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_BYTES) {
+    return NextResponse.json({ error: "clip too long" }, { status: 413 });
+  }
+
+  // only audio uploads belong here (mic clients send e.g. audio/webm;codecs=opus)
+  const mime = req.headers.get("content-type") || "audio/webm";
+  const mediaType = mime.split(";")[0].trim().toLowerCase();
+  if (!mediaType.startsWith("audio/") && mediaType !== "application/octet-stream") {
+    return NextResponse.json(
+      { error: `unsupported content-type: ${mediaType}` },
+      { status: 415 }
+    );
+  }
+
   let audio: Buffer;
   try {
     audio = Buffer.from(await req.arrayBuffer());
@@ -24,11 +40,10 @@ export async function POST(req: Request) {
   if (audio.length < 1000) {
     return NextResponse.json({ error: "clip too short" }, { status: 400 });
   }
+  // belt-and-braces: Content-Length can be absent or lie
   if (audio.length > MAX_BYTES) {
     return NextResponse.json({ error: "clip too long" }, { status: 413 });
   }
-
-  const mime = req.headers.get("content-type") || "audio/webm";
 
   try {
     const transcript = await transcribe(audio, mime);

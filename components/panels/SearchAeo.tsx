@@ -3,7 +3,9 @@
 import { memo } from "react";
 import type { Marketing } from "@/lib/vault";
 import { deltaGood, fmtAge, fmtCount, fmtDelta, fmtPct } from "@/lib/format";
-import { SectionTitle, Sparkline, verdictCls } from "./shared";
+import { NumberRoll, PanelLoading, SectionTitle, Sparkline, verdictCls } from "./shared";
+
+const VERDICT_WORD: Record<string, string> = { ok: "good", warn: "watch", bad: "bad" };
 
 // ---------------------------------------------------------------------------
 // Search & AEO — organic truth. AEO readiness (exists today) on top; GSC rows
@@ -27,24 +29,39 @@ function Row({
   sub?: string;
 }) {
   const good = deltaGood(delta, invert);
+  const cls = verdictCls(verdict);
   return (
-    <div className={`kv-row ${verdictCls(verdict)}`}>
-      <span className="kv-label">{label}</span>
-      <span className="kv-value">{value}</span>
+    <div className={`kv-row ${cls}`}>
+      <span className="kv-label">
+        {label}
+        {VERDICT_WORD[cls] && <span className="kpi-verdict"> · {VERDICT_WORD[cls]}</span>}
+      </span>
+      <span className="kv-value">
+        <NumberRoll text={value} />
+      </span>
       <span className={`kv-delta ${good === null ? "zero" : good ? "" : "neg"}`}>{delta === undefined ? sub ?? "" : fmtDelta(delta)}</span>
     </div>
   );
 }
 
-const SearchAeo = memo(function SearchAeo({ m, hot }: { m: Marketing | null; hot?: boolean }) {
+const SearchAeo = memo(function SearchAeo({ m, hot, loading }: { m: Marketing | null; hot?: boolean; loading?: boolean }) {
   const seo = m?.channels.seo;
   const aeo = m?.aeo;
+  const ig = m?.instagram;
   const T = m?.targets;
-  if (!m || (!seo?.totals && (aeo?.score === null || aeo?.score === undefined))) {
+  if (loading && !m) {
     return (
-      <section className={`block boot-stagger ${hot ? "voice-hot" : ""}`} style={{ animationDelay: "0.18s" }}>
+      <section className={`block accent-violet boot-stagger ${hot ? "voice-hot" : ""}`} style={{ animationDelay: "0.24s" }}>
+        <SectionTitle title="Search & AEO" tick="LOADING" tickCls="dim" />
+        <PanelLoading lines={3} />
+      </section>
+    );
+  }
+  if (!m || (!seo?.totals && (aeo?.score === null || aeo?.score === undefined) && !ig?.followers)) {
+    return (
+      <section className={`block accent-violet boot-stagger ${hot ? "voice-hot" : ""}`} style={{ animationDelay: "0.24s" }}>
         <SectionTitle title="Search & AEO" tick="WAITING ON PULL" tickCls="dim" />
-        <div className="prio dim">no organic data yet</div>
+        <div className="prio dim">no organic data yet — run Pull Data</div>
       </section>
     );
   }
@@ -55,7 +72,7 @@ const SearchAeo = memo(function SearchAeo({ m, hot }: { m: Marketing | null; hot
     : `AEO · ${fmtAge(aeo?.ts ?? null).label}`;
 
   return (
-    <section className={`block boot-stagger ${hot ? "voice-hot" : ""}`} style={{ animationDelay: "0.18s" }}>
+    <section className={`block accent-violet boot-stagger ${hot ? "voice-hot" : ""}`} style={{ animationDelay: "0.24s" }}>
       <SectionTitle title="Search & AEO" tick={tick} tickCls={age.stale ? "warn" : ""} />
 
       {st ? (
@@ -71,12 +88,26 @@ const SearchAeo = memo(function SearchAeo({ m, hot }: { m: Marketing | null; hot
           />
           {seo!.spark.clicks && seo!.spark.clicks.length > 1 && (
             <div className="spark-row">
+              {seo!.spark.impressions && seo!.spark.impressions.length > 1 && (
+                <Sparkline points={seo!.spark.impressions} className="spark-dim" />
+              )}
               <Sparkline points={seo!.spark.clicks} />
             </div>
           )}
           {seo!.striking_distance.length > 0 && (
-            <div className="wire-note">
-              {seo!.striking_distance.length} queries in striking distance (pos 8–20)
+            <div className="striking">
+              <div className="striking-head">
+                {seo!.striking_distance.length} queries in striking distance · pos 8–20
+              </div>
+              {seo!.striking_distance.slice(0, 3).map((q) => (
+                <div className="striking-row" key={q.query}>
+                  <span className="sq-query" title={q.query}>
+                    {q.query}
+                  </span>
+                  <span className="sq-pos">pos {q.position.toFixed(1)}</span>
+                  <span className="sq-impr">{fmtCount(q.impressions)} impr</span>
+                </div>
+              ))}
             </div>
           )}
         </>
@@ -84,6 +115,17 @@ const SearchAeo = memo(function SearchAeo({ m, hot }: { m: Marketing | null; hot
         <div className="wire-note">
           GSC · {seo?.status === "skipped" ? "waiting on Google OAuth — docs/marketing-setup.md §2" : seo?.error || "no data"}
         </div>
+      )}
+
+      {ig && ig.status !== "skipped" && ig.followers !== undefined && (
+        <Row
+          label={`Instagram${ig.handle ? ` · @${ig.handle}` : ""}`}
+          value={fmtCount(ig.followers)}
+          verdict={ig.verdicts?.er}
+          sub={`ER ${ig.er_pct !== null && ig.er_pct !== undefined ? fmtPct(ig.er_pct, 2) : "—"} / ${
+            T ? T.ig_min_er_pct.toFixed(1) : "1.0"
+          }% · ${ig.cadence_per_week ?? "—"} posts/wk${ig.status === "stale" ? " · STALE" : ""}`}
+        />
       )}
 
       {aeo && aeo.score !== null && aeo.score !== undefined && (

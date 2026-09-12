@@ -10,18 +10,26 @@ import { homeEnv } from "./homeEnv";
 // components/ReportOverlay.tsx.
 // ---------------------------------------------------------------------------
 
+/** Reads CONSOLE_* first, then the pre-rename HUD_* name. Existing
+ *  ~/.claude/.env files still say HUD_TZ / HUD_USER_NAME, and the skills under
+ *  ~/.claude/skills/ read HUD_TZ directly — honouring both keeps a machine
+ *  that was set up before the rename working untouched. */
+function consoleEnv(suffix: string): string | undefined {
+  return homeEnv(`CONSOLE_${suffix}`) ?? homeEnv(`HUD_${suffix}`);
+}
+
 /** Vault root — the folder of plain files everything reads/writes.
- *  Defaults to the bundled starter vault so the HUD renders demo data
+ *  Defaults to the bundled starter vault so the console renders demo data
  *  before any setup. Point it at your real vault when ready. */
 export const VAULT_ROOT =
   homeEnv("VAULT_ROOT") ?? path.resolve(process.cwd(), "starter-vault");
 
 /** IANA timezone for "today" — daily notes, schedules, and the runner must
  *  all agree on this or dates flip near midnight UTC. */
-export const HUD_TZ = homeEnv("HUD_TZ") ?? "America/Chicago";
+export const CONSOLE_TZ = consoleEnv("TZ") ?? "America/Chicago";
 
 /** Local voice-server (Kokoro TTS + faster-whisper STT). */
 export const VOICE_SERVER_URL = homeEnv("VOICE_SERVER_URL") ?? "http://127.0.0.1:3108";
 
 /** How the voice prompts refer to you ("<name>: <what you said>"). */
-export const USER_NAME = homeEnv("HUD_USER_NAME") ?? "User";
+export const USER_NAME = consoleEnv("USER_NAME") ?? "User";

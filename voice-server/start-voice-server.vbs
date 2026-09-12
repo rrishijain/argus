@@ -6,10 +6,11 @@ Set WshShell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 dir = fso.GetParentFolderName(WScript.ScriptFullName)
 
-' Wake word off by default — speaker bleed into the mic makes hands-free
-' overlap with ARGUS's own replies unless you wear headphones.
-' Delete this line (or set "on") to arm hands-free.
-WshShell.Environment("PROCESS")("WAKE_WORD") = "off"
+' Wake word defaults OFF in the server itself (WAKE_DEFAULT in wakeword.py)
+' — speaker bleed into the mic makes hands-free overlap with ARGUS's own
+' replies unless you wear headphones. Uncomment to arm hands-free here, or
+' set WAKE_WORD=on in ~/.claude/.env.
+' WshShell.Environment("PROCESS")("WAKE_WORD") = "on"
 
 WshShell.Run """" & dir & "\.venv\Scripts\python.exe"" """ & dir & "\server.py""", 0, False
 Set WshShell = Nothing

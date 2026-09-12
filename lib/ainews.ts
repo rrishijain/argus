@@ -29,7 +29,8 @@ const FEEDS: { source: string; url: string; filter?: boolean }[] = [
 
 // gen-AI relevance gate for press feeds: the story must name a top lab, a
 // frontier model, or an LLM-tool concept in its TITLE. Lab feeds skip this.
-const GEN_AI_RE = new RegExp(
+// Exported for lib/newsShorts.ts, which gates Tavily results the same way.
+export const GEN_AI_RE = new RegExp(
   [
     "openai", "chatgpt", "gpt-?\\d", "\\bgpt\\b", "anthropic", "claude", "gemini",
     "deepmind", "llama", "meta ai", "mistral", "\\bgrok\\b", "\\bxai\\b", "x\\.ai",
@@ -127,7 +128,7 @@ async function fetchAll(): Promise<{ items: NewsItem[]; feeds_ok: number }> {
   const results = await Promise.allSettled(
     FEEDS.map(async (f) => {
       const res = await fetch(f.url, {
-        headers: { "User-Agent": "Mozilla/5.0 (Macintosh) ARGUS-HUD/1.0" },
+        headers: { "User-Agent": "Mozilla/5.0 (Macintosh) ARGUS-Console/1.0" },
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         cache: "no-store",
       });

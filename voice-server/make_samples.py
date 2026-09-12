@@ -15,9 +15,11 @@ import glob
 import os
 import sys
 
-# Windows/CUDA only — no-ops on Mac and Linux, where the glob finds nothing
+# Windows/CUDA only — no-ops on Mac and Linux, where the glob finds nothing.
+# Keep the add_dll_directory handles alive or the directories drop off again.
+_dll_dirs = []
 for _d in glob.glob(os.path.join(sys.prefix, "Lib", "site-packages", "nvidia", "*", "bin")):
-    os.add_dll_directory(_d)
+    _dll_dirs.append(os.add_dll_directory(_d))
     os.environ["PATH"] = _d + os.pathsep + os.environ["PATH"]
     os.environ.setdefault("ONNX_PROVIDER", "CUDAExecutionProvider")
 

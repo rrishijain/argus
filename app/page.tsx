@@ -1,5 +1,5 @@
-import HUD from "@/components/HUD";
+import Console from "@/components/Console";
 
 export default function Page() {
-  return <HUD />;
+  return <Console />;
 }

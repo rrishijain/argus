@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { VaultState } from "@/lib/vault";
 import { SectionTitle } from "./shared";
 
@@ -73,48 +73,64 @@ export const DECK_GROUPS: { group: string; items: DeckItem[] }[] = [
   },
 ];
 
-/** Flat list — handy for the router and tests. */
-export const DECK_SKILLS = DECK_GROUPS.flatMap((g) => g.items);
-
 export default function CommandDeck({
   state,
   hot,
   allowed,
   onQueued,
+  onCreativeIntelligence,
 }: {
   state: VaultState | null;
   hot?: boolean;
   /** skills the API will accept right now (from /api/queue's ALLOWED_SKILLS) */
   allowed: Set<string>;
   onQueued: (skill: string, ok: boolean) => void;
+  onCreativeIntelligence?: () => void;
 }) {
-  const [cooldown, setCooldown] = useState<Record<string, boolean>>({});
+  // per-skill button state: "queued" holds the 15s dedupe cooldown; "failed"
+  // shows immediately on error and clears fast so a retry isn't blocked
+  const [fired, setFired] = useState<Record<string, "queued" | "failed" | undefined>>({});
+  const timersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  useEffect(
+    () => () => {
+      timersRef.current.forEach(clearTimeout);
+    },
+    []
+  );
 
   const fire = async (item: DeckItem) => {
-    if (cooldown[item.skill]) return;
+    if (fired[item.skill]) return;
     const args: Record<string, unknown> = { ...(item.args ?? {}) };
     if (item.ask) {
       const v = window.prompt(item.ask.label, "");
       if (v === null) return; // cancelled — queue nothing
       if (v.trim()) args[item.ask.key] = v.trim();
     }
-    setCooldown((c) => ({ ...c, [item.skill]: true }));
+    setFired((c) => ({ ...c, [item.skill]: "queued" }));
+    let ok = false;
     try {
       const res = await fetch("/api/queue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ skill: item.skill, args }),
       });
-      onQueued(item.skill, res.ok);
+      ok = res.ok;
     } catch {
-      onQueued(item.skill, false);
+      ok = false;
     }
-    setTimeout(() => setCooldown((c) => ({ ...c, [item.skill]: false })), 15000);
+    onQueued(item.skill, ok);
+    if (!ok) setFired((c) => ({ ...c, [item.skill]: "failed" }));
+    timersRef.current.push(
+      setTimeout(
+        () => setFired((c) => ({ ...c, [item.skill]: undefined })),
+        ok ? 15000 : 4000
+      )
+    );
   };
 
   const r = state?.runner;
   return (
-    <section className={`block boot-stagger ${hot ? "voice-hot" : ""}`} style={{ animationDelay: "0.26s" }}>
+    <section className={`block accent-pink boot-stagger ${hot ? "voice-hot" : ""}`} style={{ animationDelay: "0.26s" }}>
       <SectionTitle
         title="Command Deck"
         tick={r ? `${r.busy ? "ENGAGED" : "IDLE"} · ${r.active}/${r.max_concurrent} ACTIVE · ${r.pending} QUEUED` : "RUNNER OFFLINE"}
@@ -134,20 +150,30 @@ export default function CommandDeck({
             <div className="deck-group-label">{g.group}</div>
             {g.items.map((d) => {
               const on = allowed.has(d.skill) && d.enabled !== false;
+              const st = fired[d.skill];
               return (
                 <button
                   key={d.skill}
-                  className={`deck-btn ${cooldown[d.skill] ? "fired" : ""} ${on ? "" : "soon"}`}
+                  className={`deck-btn ${st === "queued" ? "fired" : ""} ${st === "failed" ? "failed" : ""} ${on ? "" : "soon"}`}
                   onClick={() => fire(d)}
-                  disabled={!on || cooldown[d.skill]}
+                  disabled={!on || !!st}
                   title={on ? d.skill : `${d.skill} — not wired yet`}
                 >
                   <span className="deck-dot" />
-                  <span className="deck-label">{cooldown[d.skill] ? "QUEUED" : d.label}</span>
+                  <span className="deck-label">
+                    {st === "queued" ? "QUEUED" : st === "failed" ? "FAILED" : d.label}
+                  </span>
                   <span className="deck-arrow">→</span>
                 </button>
               );
             })}
+            {g.group === "Report" && onCreativeIntelligence && (
+              <button className="deck-btn" onClick={onCreativeIntelligence} title="Inspect ad creative performance, Gemini observations and creative briefs">
+                <span className="deck-dot" />
+                <span className="deck-label">Creative Intel</span>
+                <span className="deck-arrow">→</span>
+              </button>
+            )}
           </div>
         ))}
       </div>

@@ -1,10 +1,10 @@
 import fs from "fs";
 import path from "path";
-import { VAULT_ROOT, HUD_TZ } from "./config";
+import { VAULT_ROOT, CONSOLE_TZ } from "./config";
 import type { Metric } from "./vault";
 
 // ---------------------------------------------------------------------------
-// Engagement engine — streaks, quests, momentum, records. Pure HUD-domain
+// Engagement engine — streaks, quests, momentum, records. Pure console-domain
 // gamification over files the vault already writes: system/runs/*.json,
 // system/publish-ledger.json, daily-notes/*.md frontmatter + Daily Drivers,
 // system/metrics/history/meta-daily.csv.
@@ -82,7 +82,7 @@ export interface RecordEntry {
 }
 
 export interface Engagement {
-  /** HUD_TZ day this snapshot describes — the client's rollover guard */
+  /** CONSOLE_TZ day this snapshot describes — the client's rollover guard */
   date: string;
   streaks: Streaks;
   quests: Quests;
@@ -95,9 +95,9 @@ const ATRISK_HOUR = 20; // 8pm local — "your chain dies tonight"
 const DAY_MS = 86_400_000;
 const RECORDS_FILE = path.join(VAULT_ROOT, "system", "engagement-records.json");
 
-const DAY_FMT = new Intl.DateTimeFormat("en-CA", { timeZone: HUD_TZ });
+const DAY_FMT = new Intl.DateTimeFormat("en-CA", { timeZone: CONSOLE_TZ });
 const HOUR_FMT = new Intl.DateTimeFormat("en-GB", {
-  timeZone: HUD_TZ,
+  timeZone: CONSOLE_TZ,
   hour: "2-digit",
   hourCycle: "h23",
 });
@@ -116,7 +116,7 @@ function addDays(day: string, n: number): string {
 // ---------------------------------------------------------------------------
 
 interface RunFacts {
-  day: string | null; // completion day in HUD_TZ
+  day: string | null; // completion day in CONSOLE_TZ
   ok: boolean;
   terminal: boolean;
 }
@@ -245,7 +245,7 @@ let ledgerCache: { mtime: number; days: Map<string, { blog: number; carousel: nu
   null;
 
 // Mirrors publishedToday() in runner/runner.js — same Date parse, same
-// formatter, so the HUD's cap chips can never disagree with the enforcer.
+// formatter, so the console's cap chips can never disagree with the enforcer.
 function readLedgerDays(): Map<string, { blog: number; carousel: number }> {
   const p = path.join(VAULT_ROOT, "system", "publish-ledger.json");
   let mtime: number;
@@ -313,7 +313,7 @@ function readDailyRevenue(): Map<string, number> {
 // records — persisted bests. Live recompute is not durable (meta-daily.csv is
 // a 90-day window, vault-cleanup archives old daily notes), so a best is
 // written down the poll it is first seen. Single writer: this Next server
-// process (the runner never touches this file). `seen` = the HUD_TZ day the
+// process (the runner never touches this file). `seen` = the CONSOLE_TZ day the
 // record was noticed — brokenToday survives reloads because it compares
 // against the store, not client state.
 // ---------------------------------------------------------------------------

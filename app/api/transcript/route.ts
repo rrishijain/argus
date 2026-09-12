@@ -35,6 +35,11 @@ export async function GET() {
 // DELETE /api/transcript — wipe the conversation ring (also resets the
 // router's short-term memory and any pending offer follow-through)
 export async function DELETE() {
-  clearMemory();
+  try {
+    clearMemory();
+  } catch (e) {
+    console.error("[api/transcript] clearMemory failed:", e);
+    return NextResponse.json({ ok: false, error: "failed to clear memory" }, { status: 500 });
+  }
   return NextResponse.json({ ok: true });
 }

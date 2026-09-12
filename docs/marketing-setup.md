@@ -67,11 +67,11 @@ The 6-hourly launchd job `com.argus.metrics` runs the same script.
 
 | File (under `<vault>/system/metrics/`) | Written by | Read by |
 |---|---|---|
-| `metrics.csv` | every `pull_*.py` | HUD sparklines (`lib/vault.ts readMetrics`) |
+| `metrics.csv` | every `pull_*.py` | console sparklines (`lib/vault.ts readMetrics`) |
 | `history/meta-daily.csv`, `google-daily.csv`, `gsc-daily.csv` | pull scripts (90-day upsert) | `marketing_context.py` |
 | `ads-latest.json`, `seo-latest.json`, `aeo-latest.json`, `ig-latest.json` | pull scripts | dashboard, context |
 | `last-pull.json` | `_common.update_snapshot` | Sources panel, DATA chip |
-| `marketing-latest.json` | `marketing_context.py --write-latest` | **HUD** (`VaultState.marketing`) |
+| `marketing-latest.json` | `marketing_context.py --write-latest` | **Console** (`VaultState.marketing`) |
 | `context/<scope>-<range>d.json` | `marketing_context.py --write` | perf-report, report-deck |
 
 Targets (breakeven ROAS, CPA ceilings, monthly budget…) live in
@@ -157,6 +157,6 @@ to allow a re-publish of the same slug.
 
 ## Reports
 - `perf-report` (AI) → `inbox/reports/perf/`; `report-deck` (direct-exec PPTX + HTML)
-  → `inbox/reports/decks/`, served to the HUD by `/api/file`.
+  → `inbox/reports/decks/`, served to the console by `/api/file`.
 - Weekly: `com.argus.weekly-deck` (launchd, Mon 08:30) enqueues a blended
   7-day deck through the runner so it shows on the wall and is spoken.

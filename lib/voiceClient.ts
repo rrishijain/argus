@@ -106,7 +106,7 @@ class VoiceClient {
     window.addEventListener("pointerdown", unlock);
     window.addEventListener("keydown", unlock);
 
-    // cross-tab speech lock. Two HUD tabs used to speak the same reply at
+    // cross-tab speech lock. Two console tabs used to speak the same reply at
     // the same time — the classic "it overlays itself" bug. Only the tab
     // holding the lead plays audio; touching a tab hands it the lead and
     // silences the others mid-sentence.
@@ -138,7 +138,8 @@ class VoiceClient {
           this.log("err", "voice offline — voice-server on :3108 is down");
         } else if (res.ok) {
           const j = (await res.json().catch(() => ({}))) as { engine?: string };
-          this.log("ok", `voice link armed — ${j.engine ?? "kokoro"} · local`);
+          const engine = j.engine ?? "kokoro";
+          this.log("ok", `voice link armed — ${engine} · ${engine === "elevenlabs" ? "cloud" : "local"}`);
         }
       })
       .catch(() => {});

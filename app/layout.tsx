@@ -18,7 +18,7 @@ const body = Inter({
 
 export const metadata: Metadata = {
   title: "ARGUS — Autonomous Reporting & Growth Unified System",
-  description: "Marketing operating system HUD — paid media, search, and publishing over a plain-file vault",
+  description: "Marketing operating system console — paid media, search, and publishing over a plain-file vault",
 };
 
 export default function RootLayout({

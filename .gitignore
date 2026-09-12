@@ -17,6 +17,9 @@ starter-vault/system/queue/*.json
 starter-vault/system/voice/
 starter-vault/system/runner-status.json
 
+# Claude Code — personal, per-project settings (docs: keep out of git)
+.claude/settings.local.json
+
 # ARGUS local setup
 .env
 .env.local
@@ -25,3 +28,14 @@ logs/
 runner/runner.log
 voice-server/kokoro-v1.0.onnx
 voice-server/voices-v1.0.bin
+
+# Private configuration, generated reports and local runtime artifacts
+.env*
+/.argus-local/
+/outputs/
+/reports/
+/*.pdf
+*.log
+*.pid
+**/__pycache__/
+.DS_Store

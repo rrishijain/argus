@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Client-safe number/date formatters shared by the HUD panels and the voice
+// Client-safe number/date formatters shared by the console panels and the voice
 // router. No fs, no config imports — this file is bundled into the browser.
 // Indian grouping throughout: 4,02,927 · ₹4.0L · ₹2.2Cr.
 // ---------------------------------------------------------------------------

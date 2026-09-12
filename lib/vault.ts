@@ -1,7 +1,8 @@
 import fs from "fs";
 import path from "path";
-import { VAULT_ROOT, HUD_TZ } from "./config";
+import { VAULT_ROOT, CONSOLE_TZ } from "./config";
 import { ALLOWED_SKILLS } from "./skills";
+import { currentPullHealth } from "./freshness";
 import { readEngagement, type Engagement } from "./engagement";
 
 export type {
@@ -75,7 +76,7 @@ export interface RunnerStatus {
 // --- marketing-latest.json ----------------------------------------------------
 // Written by ~/.claude/skills/metrics-pull/scripts/marketing_context.py after
 // every pull. It is the single source of truth for verdicts, pacing and flags —
-// the HUD only renders; it never recomputes a threshold.
+// the console only renders; it never recomputes a threshold.
 export type Verdict = "green" | "amber" | "red" | "na";
 export type CampaignVerdict = "SCALE" | "WATCH" | "FIX" | "KILL" | "NA";
 export type PullStatus = "ok" | "partial" | "stale" | "error" | "skipped" | "mock";
@@ -206,6 +207,16 @@ export interface InstagramSnapshot {
   verdicts?: { er: Verdict; cadence: Verdict };
 }
 
+/** Contribution after ad spend, computed in marketing_context.py (never in TS). */
+export interface Economics {
+  gross_profit: number;
+  contribution: number;
+  gross_margin_pct: number;
+  margin_pct: number | null;
+  per_day: number | null;
+  verdict: Verdict;
+}
+
 export interface Pacing {
   month: string;
   month_label: string;
@@ -222,6 +233,11 @@ export interface Pacing {
   status: "over" | "under" | "on";
   blended_roas_mtd: number | null;
   breakeven_roas: number;
+  /** added 2026-09-03 — absent in contexts written by an older pull */
+  days_left?: number;
+  contribution_mtd?: number | null;
+  projected_revenue_eom?: number;
+  projected_contribution_eom?: number | null;
 }
 
 export interface MarketingFlag {
@@ -241,6 +257,7 @@ export interface PullSource {
 }
 
 export interface PullHealth {
+  max_age_s?: number;
   sources: PullSource[];
   overall: "fresh" | "partial" | "stale" | "unknown";
   newest_age_s: number | null;
@@ -255,6 +272,7 @@ export interface Blended {
   deltas: Record<string, number | null>;
   verdicts: Record<string, Verdict>;
   mix: Record<string, number>;
+  economics?: Economics | null;
 }
 
 export interface Marketing {
@@ -404,6 +422,7 @@ export function readMarketing(): Marketing | null {
   if (!j || !j.targets || !j.channels || !j.pacing || !j.pull) return null;
   return {
     ...j,
+    pull: currentPullHealth(j.pull),
     flags: Array.isArray(j.flags) ? j.flags : [],
     latest_reports: j.latest_reports ?? {},
     channels: {
@@ -591,10 +610,10 @@ export function readQueue(): QueueEntry[] {
 // schema — `## Top 3 Priorities` numbered checkboxes + `## Schedule` bullets.
 export function readDailyNote(): DailyNote | null {
   const dir = path.join(VAULT_ROOT, "daily-notes");
-  // local (HUD_TZ) date — toISOString() is UTC and flips to
+  // local (CONSOLE_TZ) date — toISOString() is UTC and flips to
   // tomorrow after ~7pm CT, which made evening sessions claim today's
   // note didn't exist (same fix as runner.js todayDate())
-  const today = new Intl.DateTimeFormat("en-CA", { timeZone: HUD_TZ }).format(
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: CONSOLE_TZ }).format(
     new Date()
   );
   let file = path.join(dir, `${today}.md`);
@@ -650,7 +669,7 @@ export function readDailyNote(): DailyNote | null {
 // Only today's note is writable (stale notes are history). Index = nth
 // checkbox under `## Top 3 Priorities`, matching the parser above.
 export function toggleTop3(index: number, done: boolean): boolean {
-  const today = new Intl.DateTimeFormat("en-CA", { timeZone: HUD_TZ }).format(
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: CONSOLE_TZ }).format(
     new Date()
   );
   const file = path.join(VAULT_ROOT, "daily-notes", `${today}.md`);
@@ -682,7 +701,7 @@ export function toggleTop3(index: number, done: boolean): boolean {
 
 // --- read a vault markdown deliverable (report overlay) ---------------------------
 // Path must stay inside the vault and under the dirs runs write to (plus the
-// generated ops/ dashboard and daily notes, which the HUD opens read-only).
+// generated ops/ dashboard and daily notes, which the console opens read-only).
 const READABLE_PREFIXES = ["inbox/", "system/runs/", "ops/", "daily-notes/"];
 
 export function readVaultMarkdown(rel: string): string | null {
@@ -725,7 +744,7 @@ export interface MorningReport {
 export function readMorningReport(max = 4): MorningReport | null {
   try {
     const dir = path.join(VAULT_ROOT, "inbox", "reports", "morning");
-    const prefix = new Intl.DateTimeFormat("en-CA", { timeZone: HUD_TZ }).format(
+    const prefix = new Intl.DateTimeFormat("en-CA", { timeZone: CONSOLE_TZ }).format(
       new Date()
     );
     const file = fs

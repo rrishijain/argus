@@ -39,7 +39,7 @@ function state(over: Partial<VaultState> = {}): VaultState {
   };
 }
 
-// fully populated marketing slice (same fixture the ?demo=marketing HUD uses)
+// fully populated marketing slice (same fixture the ?demo=marketing console uses)
 const withMarketing = state(DEMO_MARKETING);
 
 const briefRunning = state({

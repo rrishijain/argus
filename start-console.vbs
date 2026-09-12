@@ -1,4 +1,4 @@
-' start-hud.vbs — launches the HUD server hidden + detached (Windows).
+' start-console.vbs — launches the console server hidden + detached (Windows).
 ' Survives the terminal/Claude session that started it. Uses the production
 ' build when one exists (fast, stable), else falls back to dev mode.
 ' Want it at login? Drop a shortcut to this file into shell:startup.

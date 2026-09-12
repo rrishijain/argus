@@ -12,7 +12,7 @@ Runs as a daemon thread inside server.py:
   energy endpointing -> whisper STT (shared model, lock in server.py) ->
   emit {"type":"transcript","text":...}.
 
-The HUD listens on ws://:3108/events: "wake" = barge-in (stop TTS, show
+The console listens on ws://:3108/events: "wake" = barge-in (stop TTS, show
 listening), "transcript" = dispatch through POST /api/voice/text.
 """
 
@@ -26,11 +26,18 @@ FRAME = 1280  # 80ms @ 16k — the frame size openwakeword expects per predict()
 # openWakeWord ships no "argus" model, so the phrase stays "hey jarvis"
 # unless a custom model is trained. Moot while WAKE_WORD=off.
 WAKE_MODEL = "hey_jarvis_v0.1"
+# THE wake default — server.py and every launcher defer to this so direct
+# launch and the .vbs agree. Off because speaker bleed into the mic makes
+# hands-free overlap with ARGUS's own replies unless you wear headphones;
+# set WAKE_WORD=on (env or ~/.claude/.env) to arm.
+WAKE_DEFAULT = "off"
 
 MAX_UTTERANCE_S = 8.0    # hard cap on post-wake capture
 NO_SPEECH_S = 2.5        # wake fired but nobody spoke -> timeout
 TRAIL_SILENCE_FRAMES = 9  # ~720ms of quiet after speech = end of utterance
 COOLDOWN_S = 1.5         # ignore re-triggers right after a capture
+MIC_RETRY_MAX = 8        # consecutive stream reopen attempts before giving up
+MIC_RETRY_CAP_S = 30.0   # backoff ceiling between reopen attempts
 
 
 class WakeListener:
@@ -41,10 +48,19 @@ class WakeListener:
         self.threshold = threshold
         self.ok = False
         self.error = None
+        self.fatal = False  # True = will not retry (setup failure / retries exhausted)
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="wake-listener")
 
     def start(self):
         self._thread.start()
+
+    def stop(self):
+        """Shutdown: signal the loop, let the `with` close the stream, join.
+        Bounded — a capture in flight lasts at most MAX_UTTERANCE_S + STT."""
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=15.0)
 
     def _run(self):
         try:
@@ -52,35 +68,58 @@ class WakeListener:
             from openwakeword.model import Model
 
             model = Model(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
-        except Exception as e:  # missing mic/deps/models — report via /health, never crash the server
+        except Exception as e:  # missing deps/models — permanent, report via /health, never crash the server
             self.error = f"{type(e).__name__}: {e}"
+            self.fatal = True
             print(f"wake word disabled: {self.error}")
             return
 
-        try:
-            with sd.InputStream(
-                samplerate=SR, channels=1, dtype="int16", blocksize=FRAME
-            ) as stream:
-                self.ok = True
-                print(f"wake word armed — '{WAKE_MODEL}' threshold={self.threshold}")
-                noise = 80.0  # rolling RMS noise floor, follows the room
-                last_fire = 0.0
-                while True:
-                    frame, _overflowed = stream.read(FRAME)
-                    pcm = frame[:, 0]
-                    rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
-                    # clamp so speech doesn't drag the floor up
-                    noise = 0.98 * noise + 0.02 * min(rms, 600.0)
-                    score = float(model.predict(pcm)[WAKE_MODEL])
-                    if score >= self.threshold and time.time() - last_fire > COOLDOWN_S:
-                        self.emit({"type": "wake", "score": round(score, 3)})
-                        self._capture(stream, noise)
-                        model.reset()
-                        last_fire = time.time()
-        except Exception as e:
-            self.ok = False
-            self.error = f"{type(e).__name__}: {e}"
-            print(f"wake listener died: {self.error}")
+        # a yanked USB mic / device switch throws mid-read; that's transient,
+        # so reopen the stream with backoff instead of dying forever
+        retries = 0
+        while not self._stop.is_set():
+            try:
+                with sd.InputStream(
+                    samplerate=SR, channels=1, dtype="int16", blocksize=FRAME
+                ) as stream:
+                    self.ok = True
+                    self.error = None
+                    retries = 0
+                    print(f"wake word armed — '{WAKE_MODEL}' threshold={self.threshold}")
+                    self._listen(stream, model)
+            except Exception as e:
+                self.ok = False
+                self.error = f"{type(e).__name__}: {e} (mic lost, retrying)"
+            if self._stop.is_set():
+                break
+            retries += 1
+            if retries > MIC_RETRY_MAX:
+                self.error = f"mic unrecoverable after {MIC_RETRY_MAX} reopens: {self.error}"
+                self.fatal = True
+                print(f"wake listener died: {self.error}")
+                return
+            delay = min(2.0 ** retries, MIC_RETRY_CAP_S)
+            print(f"wake mic reopen {retries}/{MIC_RETRY_MAX} in {delay:.0f}s: {self.error}")
+            self._stop.wait(delay)
+        self.ok = False
+
+    def _listen(self, stream, model):
+        """Predict loop on an open stream — returns only on stop signal;
+        stream errors propagate to the reopen loop in _run."""
+        noise = 80.0  # rolling RMS noise floor, follows the room
+        last_fire = 0.0
+        while not self._stop.is_set():
+            frame, _overflowed = stream.read(FRAME)
+            pcm = frame[:, 0]
+            rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
+            # clamp so speech doesn't drag the floor up
+            noise = 0.98 * noise + 0.02 * min(rms, 600.0)
+            score = float(model.predict(pcm)[WAKE_MODEL])
+            if score >= self.threshold and time.time() - last_fire > COOLDOWN_S:
+                self.emit({"type": "wake", "score": round(score, 3)})
+                self._capture(stream, noise)
+                model.reset()
+                last_fire = time.time()
 
     def _capture(self, stream, noise):
         """Record until the speaker goes quiet, then STT and emit."""
@@ -89,7 +128,7 @@ class WakeListener:
         started = False
         silent = 0
         t0 = time.time()
-        while time.time() - t0 < MAX_UTTERANCE_S:
+        while time.time() - t0 < MAX_UTTERANCE_S and not self._stop.is_set():
             frame, _ = stream.read(FRAME)
             pcm = frame[:, 0]
             frames.append(pcm.copy())
@@ -105,7 +144,7 @@ class WakeListener:
                     self.emit({"type": "wake_timeout"})
                     return
 
-        if not started:
+        if not started or self._stop.is_set():
             self.emit({"type": "wake_timeout"})
             return
 

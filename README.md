@@ -11,14 +11,14 @@ Code reads `ONBOARD.md` and interviews you — vault location, timezone, your
 metrics, your voice — applying every edit for you. The rest of this README
 is for humans who want to understand or do it by hand.
 
-## Quickstart (2 minutes to a living HUD)
+## Quickstart (2 minutes to a living console)
 
 ```bash
 npm install
 npx next dev -p 3107        # → http://localhost:3107
 ```
 
-That's it for the visual demo — the HUD boots against the bundled
+That's it for the visual demo — the console boots against the bundled
 `starter-vault/` with sample data. Three more pieces make it real:
 
 1. **The runner** (background skill executor): `node runner/runner.js` in a
@@ -28,10 +28,10 @@ That's it for the visual demo — the HUD boots against the bundled
    or follow `ONBOARD.md` manually.
 
 **Day-to-day**: open `claude` in this folder and say **"spin up ARGUS"** —
-it starts whatever isn't running (voice server, runner, HUD) detached, so
+it starts whatever isn't running (voice server, runner, console) detached, so
 everything survives closing the terminal. Want it automatic at login? Tell
 Claude "make ARGUS start on boot" and it wires the startup shortcuts
-(`start-hud.vbs`, `runner/start-runner.vbs`,
+(`start-console.vbs`, `runner/start-runner.vbs`,
 `voice-server/start-voice-server.vbs`).
 
 ## How it works
@@ -42,7 +42,7 @@ Claude "make ARGUS start on boot" and it wires the startup shortcuts
 ```
 ┌──────────────────────────── YOUR MACHINE ────────────────────────────┐   ┌─ CLOUD (opt) ─┐
 │                                                                      │   │               │
-│  Browser HUD ──── Next.js server ──── THE VAULT ──── Runner daemon ──┼───┼─ Anthropic    │
+│  Browser console ── Next.js server ─── THE VAULT ─── Runner daemon ──┼───┼─ Anthropic    │
 │  :3107 orb/PTT    :3107 router        plain files    polls queue,    │   │  API          │
 │       │           rules→Haiku→qwen    md/json/csv    spawns headless │   │  · Haiku route│
 │       │                │                             claude -p       │   │  · claude -p  │
@@ -59,12 +59,39 @@ Claude "make ARGUS start on boot" and it wires the startup shortcuts
 - **Mental model**: the voice layer is a dispatcher, not a worker. Files
   are the message bus — every step of every job is inspectable on disk.
 
+## Repo structure
+
+```
+argus/
+├── CLAUDE.md                     project instructions for Claude Code
+├── .claude/                      Claude Code config (canonical layout)
+│   ├── settings.json             shared, committed
+│   ├── settings.local.json       yours only, gitignored
+│   ├── skills/<name>/SKILL.md    project skills → /<name>
+│   ├── agents/<name>.md          project subagents
+│   ├── commands/<name>.md        legacy slash commands
+│   └── hooks/                    hook scripts
+├── app/                          Next.js routes + /api handlers
+├── components/                   Console.tsx, WireCore, panels/
+├── lib/                          vault reads, router, voice, engagement
+├── runner/                       the background skill executor
+├── voice-server/                 Kokoro TTS + faster-whisper STT (:3108)
+├── scripts/                      test-router, enqueue-intent, benches
+├── docs/                         architecture.html, marketing-setup.md
+└── starter-vault/                sample vault so a fresh clone renders
+```
+
+The skills ARGUS dispatches (`metrics-pull`, `perf-report`, `report-deck`, …)
+are **personal** skills in `~/.claude/skills/`, not project skills — the runner
+spawns `claude -p` with `cwd` set to other agent projects, where a project
+skill in this repo would not resolve. See [`.claude/README.md`](.claude/README.md).
+
 ## Vault structure
 
 ```
 VAULT_ROOT/                       (default: ./starter-vault)
 ├── system/
-│   ├── queue/                    intents written by HUD, claimed by runner
+│   ├── queue/                    intents written by console, claimed by runner
 │   ├── runs/                     run records + logs (*.json, *.md)
 │   ├── metrics/
 │   │   ├── metrics.csv           timestamp,source,metric,value,status,error
@@ -86,11 +113,15 @@ All env vars are read from your shell or `~/.claude/.env` (a plain
 `KEY=value` file; process env wins). `NEXT_PUBLIC_*` vars go in `.env.local`
 in the repo root instead (they're inlined into the client at build).
 
+The `CONSOLE_*` vars were called `HUD_*` before the rename. Both spellings
+are still read (`CONSOLE_*` wins), so an existing `~/.claude/.env` keeps
+working untouched.
+
 | Var | Purpose | Default |
 |---|---|---|
 | `VAULT_ROOT` | vault folder | `./starter-vault` |
-| `HUD_TZ` | IANA timezone for "today" (HUD + runner) | `America/Chicago` |
-| `HUD_USER_NAME` | how voice notes refer to you | `User` |
+| `CONSOLE_TZ` | IANA timezone for "today" (console + runner) | `America/Chicago` |
+| `CONSOLE_USER_NAME` | how voice notes refer to you | `User` |
 | `AGENTIC_OS_MODEL` | model for background `claude -p` runs | `claude-opus-4-8` |
 | `ANTHROPIC_API_KEY` | enables Haiku intent routing (~$0.002/ask) | unset (optional) |
 | `VOICE_ROUTER` | force router engine: `auto`/`rules`/`haiku`/`local` | `auto` |
@@ -134,7 +165,7 @@ open `audition.html`, pick, set `KOKORO_VOICE`/`KOKORO_SPEED`, restart.
 `--no-deps` is LOAD-BEARING (bare install overwrites onnxruntime-gpu with
 the CPU build). Then `python -c "from openwakeword.utils import
 download_models; download_models(['hey_jarvis_v0.1'])"`. Off by default:
-without headphones the wake mic hears the HUD's own speech.
+without headphones the wake mic hears the console's own speech.
 
 ## Using it
 

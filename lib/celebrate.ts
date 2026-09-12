@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // Celebration detector — a PURE diff between two engagement snapshots, so it
-// can be swept by tests like the router. The HUD primes the first snapshot
+// can be swept by tests like the router. The console primes the first snapshot
 // silently (runsPrimedRef pattern) and re-primes on date rollover; this
 // module only ever sees consecutive same-day snapshots.
 //

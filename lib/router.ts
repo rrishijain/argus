@@ -1,5 +1,5 @@
 import { homeEnv } from "./homeEnv";
-import { HUD_TZ } from "./config";
+import { CONSOLE_TZ } from "./config";
 import { ALLOWED_SKILLS } from "./skills";
 import { readMorningReport, readVaultState, type VaultState, type Metric } from "./vault";
 import { spokenINR, spokenAge } from "./format";
@@ -19,9 +19,9 @@ export interface RouteResult {
   skill?: string;
   reply: string;
   engine: "haiku" | "rules" | "local";
-  /** HUD panels the reply talks about — P3 choreography highlights them */
+  /** console panels the reply talks about — P3 choreography highlights them */
   panels?: PanelId[];
-  /** vault-relative md the reply references — HUD offers it via the reveal chip */
+  /** vault-relative md the reply references — console offers it via the reveal chip */
   deliverable?: string;
   /** "open" = pop the deliverable overlay immediately instead of offering a chip */
   reveal?: "open";
@@ -44,6 +44,7 @@ export interface Reveal {
 
 export const PANEL_IDS = [
   // ARGUS panels
+  "signals",
   "paid",
   "search",
   "sources",
@@ -54,7 +55,7 @@ export const PANEL_IDS = [
   "priorities",
   "schedule",
   "news", // AI Newsdesk (left column, live feeds)
-  // legacy ids — still emitted by older prompts / memory; HUD maps them
+  // legacy ids — still emitted by older prompts / memory; console maps them
   "vitals",
   "pipeline",
   "diagnostics",
@@ -499,7 +500,7 @@ function spokenTime(t: string): string {
 function localHour(): number {
   return parseInt(
     new Intl.DateTimeFormat("en-US", {
-      timeZone: HUD_TZ,
+      timeZone: CONSOLE_TZ,
       hour: "numeric",
       hour12: false,
     }).format(new Date()),

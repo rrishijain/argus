@@ -71,7 +71,7 @@ export function recentExchanges(maxN = MAX_RECENT): Exchange[] {
 }
 
 /** everything on disk (up to MAX_KEEP), no conversation window — feeds the
- *  HUD transcript overlay, where older exchanges are the point */
+ *  console transcript overlay, where older exchanges are the point */
 export function allExchanges(): Exchange[] {
   try {
     return readLines()

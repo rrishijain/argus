@@ -1,10 +1,10 @@
-// Shared contract between the HUD and whichever centerpiece is mounted.
+// Shared contract between the console and whichever centerpiece is mounted.
 // Kept in its own module so the type import doesn't drag a core's WebGL
 // payload into the server bundle.
 
+import type { CoreReadout, Strand } from "@/lib/strands";
+
 export type CoreMode = "idle" | "working" | "listening" | "speaking" | "error";
-export type BgMode = "flat" | "depth" | "grid" | "nebula";
-export const BG_MODES: BgMode[] = ["flat", "depth", "grid", "nebula"];
 
 /** celebration impulse tiers — "minor" never reaches the orb (panel shimmer
  *  + chime only); "major" blooms with a short gold swing; "record" is the
@@ -19,7 +19,10 @@ export interface CelebrateSignal {
 
 export interface CoreProps {
   mode?: CoreMode;
-  bgMode?: BgMode;
+  /** one wire per channel of the wall — see lib/strands.ts */
+  strands?: Strand[];
+  /** the one big figure the nucleus holds — see lib/strands.ts */
+  readout?: CoreReadout | null;
   /** real speech envelope 0..1, or null when no audio is playing */
   getLevel?: () => number | null;
   celebrate?: CelebrateSignal | null;

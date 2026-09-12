@@ -3,7 +3,7 @@
 import { memo } from "react";
 import type { Quests, RecordEntry, ShippedEntry } from "@/lib/vault";
 import { fmtAge } from "@/lib/format";
-import { SectionTitle } from "./shared";
+import { PanelLoading, SectionTitle, pressable } from "./shared";
 
 // ---------------------------------------------------------------------------
 // Shipped — everything the system produced that you can open: reports in the
@@ -24,6 +24,7 @@ const Shipped = memo(function Shipped({
   record,
   hot,
   flash,
+  loading,
   onOpen,
 }: {
   items: ShippedEntry[];
@@ -31,9 +32,25 @@ const Shipped = memo(function Shipped({
   record?: RecordEntry | null;
   hot?: boolean;
   flash?: boolean;
+  loading?: boolean;
   onOpen: (path: string) => void;
 }) {
-  if (items.length === 0) return null;
+  if (loading) {
+    return (
+      <section className={`block accent-mint boot-stagger ${hot ? "voice-hot" : ""}`} style={{ animationDelay: "0.42s" }}>
+        <SectionTitle title="Shipped" tick="LOADING" tickCls="dim" />
+        <PanelLoading />
+      </section>
+    );
+  }
+  if (items.length === 0) {
+    return (
+      <section className={`block accent-mint boot-stagger ${hot ? "voice-hot" : ""}`} style={{ animationDelay: "0.42s" }}>
+        <SectionTitle title="Shipped" tick="0 · 7D" tickCls="dim" />
+        <div className="prio dim">nothing shipped yet — finished runs land here</div>
+      </section>
+    );
+  }
   const week = items.filter((s) => s.ts && Date.now() - Date.parse(s.ts) < 7 * 86_400_000).length;
   const pub = quests?.publishes ?? null;
   const capsFull = pub
@@ -44,7 +61,7 @@ const Shipped = memo(function Shipped({
     : `${week} · 7D`;
   return (
     <section
-      className={`block boot-stagger ${hot ? "voice-hot" : ""} ${flash ? "quest-flash" : ""}`}
+      className={`block accent-mint boot-stagger ${hot ? "voice-hot" : ""} ${flash ? "quest-flash" : ""}`}
       style={{ animationDelay: "0.42s" }}
     >
       <SectionTitle title="Shipped" tick={tick} tickCls={capsFull ? "cap-full" : ""} />
@@ -55,9 +72,10 @@ const Shipped = memo(function Shipped({
           <div
             className="doc-row"
             key={s.id}
-            role="button"
-            onClick={() => (s.link ? window.open(s.link, "_blank", "noopener") : onOpen(s.deliverable_path))}
             title={s.link ?? s.deliverable_path}
+            {...pressable(() =>
+              s.link ? window.open(s.link, "_blank", "noopener") : onOpen(s.deliverable_path)
+            )}
           >
             <span className="doc-skill">
               {name}

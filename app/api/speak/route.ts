@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { speak, ttsStatus, VoiceConfigError } from "@/lib/tts";
+import { isPlainObject, requireString } from "@/lib/validate";
 
 // ---------------------------------------------------------------------------
 // GET /api/speak?text=...  → audio/mpeg stream (used as <audio src> so the
@@ -16,8 +17,14 @@ export const dynamic = "force-dynamic";
 const MAX_CHARS = 900;
 
 async function stream(text: string): Promise<Response> {
-  const trimmed = text.trim().slice(0, MAX_CHARS);
+  const trimmed = text.trim();
   if (!trimmed) return NextResponse.json({ error: "empty text" }, { status: 400 });
+  if (trimmed.length > MAX_CHARS) {
+    return NextResponse.json(
+      { error: `text too long (max ${MAX_CHARS} chars)` },
+      { status: 413 }
+    );
+  }
   try {
     const out = await speak(trimmed);
     return new Response(out.stream, {
@@ -48,11 +55,18 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-  let body: { text?: string };
+  let raw: unknown;
   try {
-    body = await req.json();
+    raw = await req.json();
   } catch {
     return NextResponse.json({ error: "bad json" }, { status: 400 });
   }
-  return stream(String(body.text ?? ""));
+  if (!isPlainObject(raw)) {
+    return NextResponse.json({ error: "body must be a JSON object" }, { status: 400 });
+  }
+  const text = requireString(raw.text, "text", { nonEmpty: true });
+  if (!text.ok) {
+    return NextResponse.json({ error: text.error }, { status: 400 });
+  }
+  return stream(text.value);
 }

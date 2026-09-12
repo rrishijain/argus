@@ -6,7 +6,7 @@
 <title>ARGUS — System Architecture</title>
 <style>
 /* ————————————————————————————————————————————————————————————————
-   The HUD documenting itself. Same palette as app/globals.css:
+   The console documenting itself. Same palette as app/globals.css:
    hue 223, oklch ink ramp, hairlines at low alpha, mono everything.
    Self-contained — no webfonts, no JS, works offline from disk.
    ———————————————————————————————————————————————————————————————— */
@@ -41,7 +41,7 @@ body {
   position: relative;
   min-height: 100vh;
 }
-/* grid + vignette atmosphere, like the HUD's backdrop */
+/* grid + vignette atmosphere, like the console's backdrop */
 body::before {
   content: "";
   position: fixed; inset: 0; pointer-events: none; z-index: 0;
@@ -75,7 +75,7 @@ h1 {
 .sub { color: var(--dim); max-width: 62ch; }
 .sub b { color: var(--ink); font-weight: 600; }
 
-/* ——— panels (corner-tick chrome, like HUD cards) ——— */
+/* ——— panels (corner-tick chrome, like console cards) ——— */
 section { margin-bottom: 64px; }
 .panel {
   position: relative;
@@ -244,7 +244,7 @@ footer::before, footer::after { content: ""; height: 1px; background: var(--line
       <div class="zone-label"><span class="dot"></span>&nbsp; Your machine</div>
       <div class="nodes">
         <div class="node">
-          <h3>BROWSER HUD <span class="port">:3107</span></h3>
+          <h3>BROWSER CONSOLE <span class="port">:3107</span></h3>
           <ul><li>orb + panels (Next.js client)</li><li>push-to-talk capture</li><li>plays TTS, mouths the audio</li></ul>
         </div>
         <div class="node">
@@ -369,7 +369,7 @@ footer::before, footer::after { content: ""; height: 1px; background: var(--line
         <div class="artifact"><code>inbox/…/report.md · system/runs/&lt;id&gt;.json</code></div>
       </div>
       <div class="life-step">
-        <div class="do">HUD notices and speaks<small>task callout morphs into the document card; ARGUS announces the summary; click to read in the overlay</small></div>
+        <div class="do">Console notices and speaks<small>task callout morphs into the document card; ARGUS announces the summary; click to read in the overlay</small></div>
         <div class="artifact"><code>state poll → callout → overlay</code></div>
       </div>
     </div>
@@ -401,10 +401,10 @@ footer::before, footer::after { content: ""; height: 1px; background: var(--line
   <div class="files">
     <div><code>lib/router.ts</code><span>engines, tiers, spoken briefing</span></div>
     <div><code>lib/tts.ts</code> · <code>lib/stt.ts</code><span>one swappable function each</span></div>
-    <div><code>lib/vault.ts</code><span>every file the HUD reads</span></div>
+    <div><code>lib/vault.ts</code><span>every file the console reads</span></div>
     <div><code>lib/skills.ts</code><span>allowed skills + intent writer</span></div>
     <div><code>lib/voiceMemory.ts</code><span>conversation ring (JSONL)</span></div>
-    <div><code>components/HUD.tsx</code><span>panels, callouts, choreography</span></div>
+    <div><code>components/Console.tsx</code><span>panels, callouts, choreography</span></div>
     <div><code>components/GraphCore.tsx</code><span>the orb</span></div>
     <div><code>voice-server/server.py</code><span>Kokoro + whisper + wake word</span></div>
     <div><code>app/api/*</code><span>voice, queue, state, report, speak</span></div>

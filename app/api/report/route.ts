@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { readVaultMarkdown } from "@/lib/vault";
 
 // GET /api/report?path=inbox/... — serve a vault markdown deliverable to the
-// HUD overlay. readVaultMarkdown enforces .md-only under inbox/ or
+// console overlay. readVaultMarkdown enforces .md-only under inbox/ or
 // system/runs/, no traversal.
 
 export const dynamic = "force-dynamic";
